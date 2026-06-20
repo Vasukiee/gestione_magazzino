@@ -4,6 +4,13 @@ import ttkbootstrap as ttk
 import sqlite3
 import datetime
 import csv
+import threading
+import time
+import os
+import shutil
+import glob
+import signal
+import sys
 from setup_db import inizializza_database
 
 class TerminaleMagazzino:
@@ -12,18 +19,57 @@ class TerminaleMagazzino:
         self.root.title("Gestione Magazzino")
         self.root.geometry("1300x750")
         
-        self.conn = sqlite3.connect('magazzino.db')
+        self.conn = sqlite3.connect('magazzino.db', check_same_thread=False)
         self.tipo_movimento = tk.IntVar(value=1)
         self.var_qta = tk.IntVar(value=1)
         self.var_qta_trasf = tk.IntVar(value=1)
         self.lista_fornitori = []
         
-        # Variabili carrello
         self.carrello = []
         self.totale_carrello_str = tk.StringVar(value="€ 0.00")
         self.totale_carrello_val = 0.0
         
+        self.setup_cartelle_backup()
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        
         self.setup_ui()
+        
+        threading.Thread(target=self.worker_backup_rolling, daemon=True).start()
+
+    def setup_cartelle_backup(self):
+        os.makedirs("backup/rolling", exist_ok=True)
+        os.makedirs("backup/daily", exist_ok=True)
+
+    def worker_backup_rolling(self):
+        while True:
+            time.sleep(1800)
+            try:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                shutil.copy2('magazzino.db', f'backup/rolling/backup_{timestamp}.db')
+                
+                lista_file = sorted(glob.glob('backup/rolling/backup_*.db'), key=os.path.getmtime)
+                while len(lista_file) > 16:
+                    file_da_rimuovere = lista_file.pop(0)
+                    os.remove(file_da_rimuovere)
+            except Exception as e:
+                print(f"Errore backup rolling: {e}")
+
+    def on_closing(self):
+        try:
+            shutil.copy2('magazzino.db', 'backup/latest_backup.db')
+            data_odierna = datetime.datetime.now().strftime("%Y%m%d")
+            shutil.copy2('magazzino.db', f'backup/daily/backup_{data_odierna}.db')
+        except Exception as e:
+            print(f"Errore backup chiusura: {e}")
+        finally:
+            self.conn.close()
+            self.root.destroy()
+            sys.exit(0)
+
+    def handle_sigterm(self, signum, frame):
+        self.on_closing()
         
     def setup_ui(self):
         self.notebook = ttk.Notebook(self.root)
@@ -46,7 +92,6 @@ class TerminaleMagazzino:
         
         self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
 
-    # --- SCHEDA 1: MOVIMENTI ---
     def setup_tab_movimenti(self):
         paned = ttk.Panedwindow(self.tab_movimenti, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
@@ -107,7 +152,6 @@ class TerminaleMagazzino:
         self.tree_log.tag_configure('rimosso', foreground='red')
         self.tree_log.pack(fill=tk.BOTH, expand=True)
 
-        # --- SEZIONE CARRELLO (right_frame) ---
         cart_frame = ttk.LabelFrame(right_frame, text="Carrello Attuale (Solo Scarico/Vendita)")
         cart_frame.pack(fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 0), ipadx=10, ipady=10)
         
@@ -166,7 +210,6 @@ class TerminaleMagazzino:
         except sqlite3.OperationalError:
             self.lista_fornitori = []
 
-    # --- SCHEDA 2: TRASFERIMENTI ---
     def setup_tab_trasferimenti(self):
         ctrl_frame = ttk.Frame(self.tab_trasferimenti)
         ctrl_frame.pack(fill=tk.X, pady=20)
@@ -194,7 +237,6 @@ class TerminaleMagazzino:
         
         self.entry_codice_trasf.bind('<Return>', self.esegui_trasferimento)
 
-    # --- SCHEDA 3: RICERCA E STORICO ---
     def setup_tab_ricerca(self):
         search_top = ttk.Frame(self.tab_ricerca)
         search_top.pack(fill=tk.X, pady=(0, 10))
@@ -214,6 +256,9 @@ class TerminaleMagazzino:
         
         btn_esporta_giac = ttk.Button(search_top, text="Esporta Giacenze CSV", command=self.esporta_giacenze_csv, bootstyle="success")
         btn_esporta_giac.pack(side=tk.RIGHT, padx=(0, 10))
+        
+        btn_pulisci = ttk.Button(search_top, text="Elimina Giacenze Zero", command=self.pulizia_zero, bootstyle="danger")
+        btn_pulisci.pack(side=tk.RIGHT, padx=(0, 10))
         
         self.entry_ricerca.bind('<Return>', lambda e: self.esegui_ricerca())
         
@@ -242,7 +287,167 @@ class TerminaleMagazzino:
         self.tree_ricerca.column('giac_box', width=90, anchor=tk.CENTER)
         self.tree_ricerca.pack(fill=tk.BOTH, expand=True)
 
-    # --- SCHEDA 4: STATISTICHE ---
+        self.menu_contestuale = tk.Menu(self.root, tearoff=0)
+        self.menu_contestuale.add_command(label="Modifica / Rettifica", command=self.apri_modifica)
+        self.menu_contestuale.add_command(label="Elimina Intero Record", command=self.elimina_selezionato)
+        
+        self.tree_ricerca.bind("<Button-3>", self.mostra_menu_contestuale)
+
+    def mostra_menu_contestuale(self, event):
+        item = self.tree_ricerca.identify_row(event.y)
+        if item:
+            self.tree_ricerca.selection_set(item)
+            self.tree_ricerca.focus(item)
+            self.menu_contestuale.tk_popup(event.x_root, event.y_root)
+
+    def apri_modifica(self):
+        selected = self.tree_ricerca.focus()
+        if not selected: return
+        valori = self.tree_ricerca.item(selected)['values']
+        codice = valori[0]
+        
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Modifica & Rettifica Inventario - {codice}")
+        popup.geometry("500x420")
+        popup.grab_set()
+        
+        form = ttk.Frame(popup)
+        form.pack(fill=tk.BOTH, expand=True, ipadx=10, ipady=10)
+        
+        campi = ["Descrizione:", "Colore:", "Taglia:", "Costo Acq (€):", "Prezzo Ven (€):", "Giacenza Negozio:", "Giacenza Box:"]
+        valori_attuali = [
+            valori[1], 
+            valori[2], 
+            valori[3], 
+            str(valori[4]).replace('€ ', ''), 
+            str(valori[5]).replace('€ ', ''),
+            str(valori[6]),
+            str(valori[7])
+        ]
+        entries = {}
+        
+        for i, label in enumerate(campi):
+            ttk.Label(form, text=label, font=('Helvetica', 11, 'bold' if 'Giacenza' in label else 'normal')).grid(row=i, column=0, sticky=tk.E, pady=7)
+            ent = ttk.Entry(form, width=30)
+            ent.grid(row=i, column=1, pady=7)
+            val = valori_attuali[i] if str(valori_attuali[i]) != 'None' else ''
+            ent.insert(0, val)
+            entries[label] = ent
+            
+        def salva(e=None):
+            desc = entries["Descrizione:"].get().strip()
+            if not desc: return
+            
+            p_acq_str = entries["Costo Acq (€):"].get().replace(',', '.')
+            p_ven_str = entries["Prezzo Ven (€):"].get().replace(',', '.')
+            
+            p_acq = float(p_acq_str) if p_acq_str.replace('.','',1).isdigit() else 0.0
+            p_ven = float(p_ven_str) if p_ven_str.replace('.','',1).isdigit() else 0.0
+            
+            try:
+                nuova_giac_neg = int(entries["Giacenza Negozio:"].get().strip())
+                nuova_giac_box = int(entries["Giacenza Box:"].get().strip())
+            except ValueError:
+                nuova_giac_neg = int(valori[6])
+                nuova_giac_box = int(valori[7])
+            
+            cursor = self.conn.cursor()
+            try:
+                variazioni = []
+                if desc != str(valori[1]): variazioni.append("Desc")
+                if p_ven != float(str(valori[5]).replace('€ ', '')): variazioni.append("Prezzo")
+                
+                cursor.execute("""
+                    UPDATE articoli SET descrizione = ?, colore = ?, taglia = ?, prezzo_acquisto = ?, prezzo_vendita = ?
+                    WHERE codice = ?
+                """, (desc, entries["Colore:"].get(), entries["Taglia:"].get(), p_acq, p_ven, codice))
+                
+                # Inserimenti anomalie stock (Tipi 6 e 7)
+                delta_neg = nuova_giac_neg - int(valori[6])
+                if delta_neg > 0:
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, 1, 6)", (codice, delta_neg))
+                elif delta_neg < 0:
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, tipo) VALUES (?, ?, 1, 7)", (codice, abs(delta_neg)))
+                    
+                delta_box = nuova_giac_box - int(valori[7])
+                if delta_box > 0:
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, 2, 6)", (codice, delta_box))
+                elif delta_box < 0:
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, tipo) VALUES (?, ?, 2, 7)", (codice, abs(delta_box)))
+                
+                # Inserimento anomalia anagrafica (Tipo 8)
+                if variazioni:
+                    nota = "Modificato manualmente: " + ", ".join(variazioni)
+                    try:
+                        cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, tipo, riferimento_bolla) VALUES (?, 0, 8, ?)", (codice, nota))
+                    except sqlite3.OperationalError:
+                        cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, tipo) VALUES (?, 0, 8)", (codice,))
+                
+                self.conn.commit()
+                popup.destroy()
+                self.esegui_ricerca()
+            except sqlite3.Error as err:
+                messagebox.showerror("Errore DB", str(err))
+
+        ttk.Button(popup, text="Salva Modifiche", command=salva, bootstyle="success").pack(pady=10)
+
+    def elimina_selezionato(self):
+        selected = self.tree_ricerca.focus()
+        if not selected: return
+        codice = self.tree_ricerca.item(selected)['values'][0]
+        
+        if messagebox.askyesno("Eliminazione", f"Sei sicuro di voler eliminare l'articolo {codice} e tutti i suoi movimenti?"):
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("DELETE FROM movimenti_magazzino WHERE codice = ?", (codice,))
+                cursor.execute("DELETE FROM articoli WHERE codice = ?", (codice,))
+                self.conn.commit()
+                self.esegui_ricerca()
+            except sqlite3.Error as e:
+                messagebox.showerror("Errore DB", str(e))
+
+    def pulizia_zero(self):
+        if not messagebox.askyesno("Avviso Critico", "Questa operazione eliminerà permanentemente tutti gli articoli (e i relativi movimenti) la cui giacenza totale tra i depositi è uguale a 0.\n\nProcedere?"):
+            return
+            
+        sql_delete_articoli = """
+        DELETE FROM articoli WHERE codice IN (
+            SELECT a.codice FROM articoli a
+            LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
+            GROUP BY a.codice
+            HAVING (
+                COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) +
+                COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0)
+            ) = 0
+        )
+        """
+        
+        sql_delete_movimenti = """
+        DELETE FROM movimenti_magazzino WHERE codice IN (
+            SELECT a.codice FROM articoli a
+            LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
+            GROUP BY a.codice
+            HAVING (
+                COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) +
+                COALESCE(SUM(CASE WHEN id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0)
+            ) = 0
+        )
+        """
+        
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql_delete_movimenti)
+            cursor.execute(sql_delete_articoli)
+            self.conn.commit()
+            messagebox.showinfo("Completato", "Inventario pulito correttamente.")
+            self.esegui_ricerca()
+        except sqlite3.Error as e:
+            messagebox.showerror("Errore DB", str(e))
+
     def setup_tab_statistiche(self):
         self.frame_stat = ttk.Frame(self.tab_statistiche)
         self.frame_stat.pack(fill=tk.BOTH, expand=True, ipadx=20, ipady=20)
@@ -273,7 +478,6 @@ class TerminaleMagazzino:
         elif "Operatività" in tab:
             self.entry_codice.focus()
 
-    # --- LOGICA TRASFERIMENTI ---
     def esegui_trasferimento(self, event=None):
         codice = self.entry_codice_trasf.get().strip()
         self.entry_codice_trasf.delete(0, tk.END)
@@ -319,7 +523,6 @@ class TerminaleMagazzino:
             
         self.esegui_query_movimento(codice, orig_id, dest_id, 5, f"Trasferimento a {dest_str}", datetime.datetime.now().strftime("%H:%M:%S"), articolo[0], qta, articolo[1], articolo[2], None, None)
 
-    # --- LOGICA STATISTICHE ---
     def aggiorna_statistiche(self):
         sql = """
         SELECT
@@ -406,7 +609,7 @@ class TerminaleMagazzino:
     def esporta_storico_csv(self):
         sql = """
         SELECT m.data_ora,
-               CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' ELSE 'Altro' END,
+               CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' ELSE 'Altro' END,
                m.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
                COALESCE(d_orig.nome_deposito, '-'), COALESCE(d_dest.nome_deposito, '-'), m.quantita,
                COALESCE(f.ragione_sociale, ''), COALESCE(m.riferimento_bolla, '')
@@ -421,10 +624,9 @@ class TerminaleMagazzino:
         try:
             cursor.execute(sql)
         except sqlite3.OperationalError:
-            # Fallback for old schema
             sql_fallback = """
             SELECT m.data_ora,
-                   CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' ELSE 'Altro' END,
+                   CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' ELSE 'Altro' END,
                    m.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
                    COALESCE(d_orig.nome_deposito, '-'), COALESCE(d_dest.nome_deposito, '-'), m.quantita,
                    '', ''
@@ -442,7 +644,7 @@ class TerminaleMagazzino:
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Costo", "Prezzo", "Origine", "Destinazione", "Quantità", "Fornitore", "Riferimento Bolla"])
+                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Costo", "Prezzo", "Origine", "Destinazione", "Quantità", "Fornitore", "Note / Bolla"])
                 writer.writerows(righe)
 
     def esporta_giacenze_csv(self):
@@ -471,26 +673,45 @@ class TerminaleMagazzino:
                     writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], totale])
 
     def esporta_report_anomalie_csv(self):
-        """Esporta un CSV contenente solo i movimenti di rettifica (tipo 6 e 7)."""
         sql = """
         SELECT m.data_ora,
-               CASE m.tipo WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' END AS operazione,
+               CASE m.tipo WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' END AS operazione,
                m.codice, a.descrizione, a.colore, a.taglia,
                COALESCE(d_orig.nome_deposito, '-') AS origine,
                COALESCE(d_dest.nome_deposito, '-') AS destinazione,
-               m.quantita
+               m.quantita,
+               COALESCE(m.riferimento_bolla, '') AS note
         FROM movimenti_magazzino m
         LEFT JOIN articoli a ON m.codice = a.codice
         LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
         LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
-        WHERE m.tipo IN (6, 7)
+        WHERE m.tipo IN (6, 7, 8)
         ORDER BY m.data_ora DESC
         """
         cursor = self.conn.cursor()
-        cursor.execute(sql)
+        try:
+            cursor.execute(sql)
+        except sqlite3.OperationalError:
+            sql_fallback = """
+            SELECT m.data_ora,
+                   CASE m.tipo WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' END AS operazione,
+                   m.codice, a.descrizione, a.colore, a.taglia,
+                   COALESCE(d_orig.nome_deposito, '-') AS origine,
+                   COALESCE(d_dest.nome_deposito, '-') AS destinazione,
+                   m.quantita,
+                   '' AS note
+            FROM movimenti_magazzino m
+            LEFT JOIN articoli a ON m.codice = a.codice
+            LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
+            LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
+            WHERE m.tipo IN (6, 7, 8)
+            ORDER BY m.data_ora DESC
+            """
+            cursor.execute(sql_fallback)
+            
         righe = cursor.fetchall()
         if not righe:
-            return messagebox.showinfo("Info", "Nessuna rettifica registrata.")
+            return messagebox.showinfo("Info", "Nessuna rettifica o modifica registrata.")
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialfile=f"report_anomalie_{datetime.datetime.now().strftime('%Y%m%d')}.csv"
@@ -498,11 +719,10 @@ class TerminaleMagazzino:
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(["Data Ora", "Tipo Rettifica", "Codice", "Descrizione", "Colore", "Taglia", "Deposito Origine", "Deposito Destinazione", "Quantità"])
+                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Deposito Origine", "Deposito Destinazione", "Quantità", "Note Aggiuntive"])
                 writer.writerows(righe)
-            messagebox.showinfo("Esportazione", f"Report anomalie esportato con {len(righe)} rettifiche.")
+            messagebox.showinfo("Esportazione", f"Report anomalie esportato con {len(righe)} righe.")
 
-    # --- GESTIONE CARRELLO E PAGAMENTO ---
     def aggiorna_ui_carrello(self):
         for item in self.tree_cart.get_children():
             self.tree_cart.delete(item)
@@ -528,15 +748,12 @@ class TerminaleMagazzino:
         selezione = self.tree_cart.selection()
         if not selezione:
             return
-        # L'indice della riga nella Treeview corrisponde all'indice in self.carrello,
-        # perché aggiorna_ui_carrello ricostruisce sempre la lista nello stesso ordine.
         indice = self.tree_cart.index(selezione[0])
         if 0 <= indice < len(self.carrello):
             item = self.carrello[indice]
             id_riga_log = item.get('id_riga_log')
             if id_riga_log and self.tree_log.exists(id_riga_log):
                 valori = list(self.tree_log.item(id_riga_log, 'values'))
-                # Barra il testo dell'esito con caratteri unicode combining strikethrough
                 valori[4] = ''.join(c + '\u0336' for c in valori[4])
                 self.tree_log.item(id_riga_log, values=valori, tags=('rimosso',))
             del self.carrello[indice]
@@ -549,14 +766,11 @@ class TerminaleMagazzino:
             
         try:
             cursor = self.conn.cursor()
-            
-            # Inseriamo la transazione
             cursor.execute("INSERT INTO transazioni (totale, metodo_pagamento) VALUES (?, ?)", (self.totale_carrello_val, metodo))
             id_transazione = cursor.lastrowid
             
             ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
             
-            # Iteriamo il carrello per salvare i movimenti di magazzino
             for item in self.carrello:
                 try:
                     cursor.execute("""
@@ -565,7 +779,6 @@ class TerminaleMagazzino:
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (item['codice'], item['qta'], item['origine'], item['destinazione'], 2, id_transazione))
                 except sqlite3.OperationalError:
-                    # Fallback nel caso la colonna id_transazione non esista (non ha fatto la migrazione)
                     cursor.execute("""
                         INSERT INTO movimenti_magazzino 
                         (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo) 
@@ -581,9 +794,8 @@ class TerminaleMagazzino:
             
         except Exception as e:
             self.conn.rollback()
-            messagebox.showerror("Errore", f"Si è verificato un errore durante la transazione:\n{e}")
+            messagebox.showerror("Errore", f"Errore durante la transazione:\n{e}")
 
-    # --- AVVIO REGISTRAZIONE / LETTURA CODICE ---
     def avvia_registrazione(self, event):
         codice = self.entry_codice.get().strip()
         self.entry_codice.delete(0, tk.END)
@@ -608,7 +820,6 @@ class TerminaleMagazzino:
             bolla = self.entry_bolla.get().strip()
             
         cursor = self.conn.cursor()
-        # Modificata la query per recuperare anche i prezzi
         cursor.execute("SELECT descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita FROM articoli WHERE codice = ?", (codice,))
         articolo = cursor.fetchone()
         origine, destinazione = (1, None) if tipo in (2, 4) else (None, 1)
@@ -617,14 +828,13 @@ class TerminaleMagazzino:
             self.mostra_popup_nuovo_articolo(codice, tipo, origine, destinazione, nome_op, ora_attuale, qta, id_fornitore, bolla)
             return
 
-        # --- LOGICA CARRELLO PER VENDITA (TIPO 2) ---
         if tipo == 2:
             item = {
                 'codice': codice,
                 'desc': articolo[0],
                 'colore': articolo[1],
                 'taglia': articolo[2],
-                'prezzo': articolo[4] or 0.0, # Indice 4 per il prezzo di vendita
+                'prezzo': articolo[4] or 0.0,
                 'qta': qta,
                 'origine': origine,
                 'destinazione': destinazione
@@ -635,7 +845,6 @@ class TerminaleMagazzino:
             item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"AGGIUNTO AL CARRELLO - {articolo[0]}")
             return
             
-        # LOGICA NORMALE PER ALTRI MOVIMENTI
         if origine is not None:
             cursor.execute("""
                 SELECT COALESCE(SUM(CASE WHEN id_deposito_destinazione = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0) - 
@@ -661,7 +870,6 @@ class TerminaleMagazzino:
             self.aggiorna_log(ora_attuale, nome_op, qta_req, codice, f"ANNULLATO - Giacenza: {giac}")
             popup.destroy()
         def forza():
-            # Registra la rettifica positiva per allineare le giacenze prima del movimento
             try:
                 self.conn.cursor().execute("""
                     INSERT INTO movimenti_magazzino 
@@ -705,9 +913,7 @@ class TerminaleMagazzino:
             
             self.conn.cursor().execute("INSERT INTO articoli (codice, descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita) VALUES (?, ?, ?, ?, ?, ?)", (codice, desc, colore_val, taglia_val, acq, ven))
             
-            # Per il carrello POS (tipo 2): creiamo l'anagrafica, aggiungiamo un carico compensativo e poi mettiamo nel carrello
             if tipo == 2:
-                # Carico compensativo silente se l'articolo è nuovo e stiamo vendendo
                 self.conn.cursor().execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, ?, 1)", (codice, qta, origine))
                 self.conn.commit()
                 
@@ -728,16 +934,6 @@ class TerminaleMagazzino:
                 popup.destroy()
                 return
 
-            if tipo == 1 or destinazione is not None:
-                # Se stiamo caricando un nuovo articolo, registriamo il primo carico con i dati bolla/fornitore
-                self.conn.cursor().execute("""
-                    INSERT INTO movimenti_magazzino 
-                    (codice, quantita, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (codice, qta, destinazione or 1, 1, id_fornitore, bolla))
-            elif origine is not None:
-                self.conn.cursor().execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, tipo) VALUES (?, ?, ?, ?)", (codice, qta, origine, tipo))
-                
             self.conn.commit()
             
             self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, desc, qta, colore_val, taglia_val, id_fornitore, bolla)
