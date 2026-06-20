@@ -1,0 +1,6 @@
+[Unit]
+Description=Chiusura applicativi e spegnimento di sistema
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl isolate poweroff.target
