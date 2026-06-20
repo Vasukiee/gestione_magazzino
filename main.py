@@ -80,16 +80,19 @@ class TerminaleMagazzino:
         self.tab_trasferimenti = ttk.Frame(self.notebook)
         self.tab_ricerca = ttk.Frame(self.notebook)
         self.tab_statistiche = ttk.Frame(self.notebook)
+        self.tab_fornitori = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_movimenti, text=" Operatività e Movimenti ")
         self.notebook.add(self.tab_trasferimenti, text=" Trasferimenti Interni ")
         self.notebook.add(self.tab_ricerca, text=" Ricerca e Storico ")
         self.notebook.add(self.tab_statistiche, text=" Statistiche ")
+        self.notebook.add(self.tab_fornitori, text=" Fornitori ")
 
         self.setup_tab_movimenti()
         self.setup_tab_trasferimenti()
         self.setup_tab_ricerca()
         self.setup_tab_statistiche()
+        self.setup_tab_fornitori()
 
         self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_changed)
 
@@ -208,7 +211,7 @@ class TerminaleMagazzino:
     def carica_fornitori(self):
         try:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT id, ragione_sociale FROM fornitori")
+            cursor.execute("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale")
             self.lista_fornitori = cursor.fetchall()
             self.combo_fornitore['values'] = [f[1] for f in self.lista_fornitori]
         except sqlite3.OperationalError:
@@ -473,6 +476,128 @@ class TerminaleMagazzino:
         btn_report_anomalie = ttk.Button(self.frame_stat, text="Esporta Report Anomalie CSV", command=self.esporta_report_anomalie_csv, bootstyle="danger")
         btn_report_anomalie.grid(row=5, column=0, sticky=tk.W, pady=(20, 0))
 
+    def setup_tab_fornitori(self):
+        paned = ttk.Panedwindow(self.tab_fornitori, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        left_frame = ttk.LabelFrame(paned, text="Anagrafica Fornitori")
+        paned.add(left_frame, weight=3)
+
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=2)
+
+        self.tree_fornitori = ttk.Treeview(left_frame, columns=('ragione_sociale',), show='headings', bootstyle="primary")
+        self.tree_fornitori.heading('ragione_sociale', text='Ragione Sociale')
+        self.tree_fornitori.column('ragione_sociale', width=300)
+        self.tree_fornitori.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.tree_fornitori.bind('<<TreeviewSelect>>', self.on_seleziona_fornitore)
+
+        form_frame = ttk.LabelFrame(right_frame, text="Nuovo / Modifica Fornitore")
+        form_frame.pack(fill=tk.X, padx=(10, 0), pady=10, ipadx=10, ipady=10)
+
+        ttk.Label(form_frame, text="Ragione Sociale:", font=('Helvetica', 12)).pack(anchor=tk.W, pady=(0, 5))
+        self.entry_nome_fornitore = ttk.Entry(form_frame, font=('Helvetica', 14), width=30)
+        self.entry_nome_fornitore.pack(fill=tk.X, pady=(0, 15))
+        self.entry_nome_fornitore.bind('<Return>', lambda e: self.salva_fornitore())
+
+        btn_frame_fornitori = ttk.Frame(form_frame)
+        btn_frame_fornitori.pack(fill=tk.X)
+
+        self.btn_salva_fornitore = ttk.Button(btn_frame_fornitori, text="Aggiungi", command=self.salva_fornitore, bootstyle="success")
+        self.btn_salva_fornitore.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+
+        btn_nuovo_fornitore = ttk.Button(btn_frame_fornitori, text="Annulla / Nuovo", command=self.reset_form_fornitore, bootstyle="secondary")
+        btn_nuovo_fornitore.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
+
+        btn_elimina_fornitore = ttk.Button(right_frame, text="Elimina Fornitore Selezionato", command=self.elimina_fornitore, bootstyle="danger")
+        btn_elimina_fornitore.pack(fill=tk.X, padx=(10, 0), pady=(0, 10))
+
+        self.fornitore_in_modifica = None
+        self.aggiorna_lista_fornitori()
+
+    def aggiorna_lista_fornitori(self):
+        for item in self.tree_fornitori.get_children():
+            self.tree_fornitori.delete(item)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale")
+        for id_forn, nome in cursor.fetchall():
+            self.tree_fornitori.insert('', tk.END, iid=str(id_forn), values=(nome,))
+        # Aggiorna anche il combobox usato nel Carico
+        self.carica_fornitori()
+
+    def on_seleziona_fornitore(self, event=None):
+        selezione = self.tree_fornitori.selection()
+        if not selezione:
+            return
+        id_forn = int(selezione[0])
+        nome = self.tree_fornitori.item(selezione[0], 'values')[0]
+        self.fornitore_in_modifica = id_forn
+        self.entry_nome_fornitore.delete(0, tk.END)
+        self.entry_nome_fornitore.insert(0, nome)
+        self.btn_salva_fornitore.config(text="Salva Modifiche")
+
+    def reset_form_fornitore(self):
+        self.fornitore_in_modifica = None
+        self.entry_nome_fornitore.delete(0, tk.END)
+        self.btn_salva_fornitore.config(text="Aggiungi")
+        self.tree_fornitori.selection_remove(self.tree_fornitori.selection())
+
+    def salva_fornitore(self):
+        nome = self.entry_nome_fornitore.get().strip()
+        if not nome:
+            messagebox.showwarning("Attenzione", "Inserire la ragione sociale del fornitore.")
+            return
+
+        cursor = self.conn.cursor()
+        try:
+            if self.fornitore_in_modifica is not None:
+                cursor.execute("UPDATE fornitori SET ragione_sociale = ? WHERE id = ?", (nome, self.fornitore_in_modifica))
+            else:
+                cursor.execute("INSERT INTO fornitori (ragione_sociale) VALUES (?)", (nome,))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Errore", f"Esiste già un fornitore con ragione sociale '{nome}'.")
+            return
+        except sqlite3.Error as e:
+            messagebox.showerror("Errore DB", str(e))
+            return
+
+        self.reset_form_fornitore()
+        self.aggiorna_lista_fornitori()
+
+    def elimina_fornitore(self):
+        selezione = self.tree_fornitori.selection()
+        if not selezione:
+            messagebox.showinfo("Info", "Seleziona un fornitore dalla lista da eliminare.")
+            return
+        id_forn = int(selezione[0])
+        nome = self.tree_fornitori.item(selezione[0], 'values')[0]
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM movimenti_magazzino WHERE id_fornitore = ?", (id_forn,))
+        n_movimenti = cursor.fetchone()[0]
+
+        messaggio = f"Eliminare il fornitore '{nome}'?"
+        if n_movimenti > 0:
+            messaggio += (f"\n\nQuesto fornitore è collegato a {n_movimenti} movimento/i di carico già registrati. "
+                          f"Il nome '{nome}' resterà comunque visibile nello storico, ma non sarà più possibile selezionarlo per nuovi carichi.")
+
+        if not messagebox.askyesno("Elimina Fornitore", messaggio):
+            return
+
+        try:
+            # Preserva il nome nello storico prima di eliminare il fornitore dall'anagrafica
+            cursor.execute("UPDATE movimenti_magazzino SET nome_fornitore_storico = ? WHERE id_fornitore = ?", (nome, id_forn))
+            cursor.execute("DELETE FROM fornitori WHERE id = ?", (id_forn,))
+            self.conn.commit()
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            messagebox.showerror("Errore DB", str(e))
+            return
+
+        self.reset_form_fornitore()
+        self.aggiorna_lista_fornitori()
+
     def mantieni_focus_scanner(self, event=None):
         # Riporta il focus sul campo codice scanner dopo un breve istante,
         # ma solo se siamo sulla tab Operatività e nessun popup (Toplevel) è aperto.
@@ -483,7 +608,13 @@ class TerminaleMagazzino:
             tab_corrente = self.notebook.tab('current')['text']
             if "Operatività" not in tab_corrente:
                 return
-            focus_attuale = self.root.focus_get()
+            try:
+                focus_attuale = self.root.focus_get()
+            except KeyError:
+                # focus_get() può puntare a widget interni effimeri (es. il popdown
+                # di un Combobox) non risolvibili da nametowidget: in quel caso
+                # consideriamo il focus "altrove" e non lo forziamo.
+                return
             # Non strappare il focus da altri campi di input legittimi della stessa tab
             if focus_attuale in (self.entry_bolla, self.combo_fornitore, self.entry_ricerca):
                 return
@@ -633,7 +764,7 @@ class TerminaleMagazzino:
                      CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' ELSE 'Altro' END,
                      m.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
                      COALESCE(d_orig.nome_deposito, '-'), COALESCE(d_dest.nome_deposito, '-'), m.quantita,
-                     COALESCE(f.ragione_sociale, ''), COALESCE(m.riferimento_bolla, '')
+                     COALESCE(f.ragione_sociale, m.nome_fornitore_storico, ''), COALESCE(m.riferimento_bolla, '')
               FROM movimenti_magazzino m
                        LEFT JOIN articoli a ON m.codice = a.codice
                        LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
@@ -1061,6 +1192,6 @@ class TerminaleMagazzino:
 
 if __name__ == "__main__":
     inizializza_database()
-    root = ttk.Window(themename="litera")
+    root = ttk.Window(themename="minty")
     app = TerminaleMagazzino(root)
     root.mainloop()
