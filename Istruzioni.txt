@@ -1,0 +1,7 @@
+Se già esiste .venv
+rm -rf .venv
+
+python -m venv .venv
+source .venv/bin/activate
+pip install ttkbootstrap
+./avvia_gestionale.sh
