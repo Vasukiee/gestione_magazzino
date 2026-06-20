@@ -6,62 +6,63 @@ def inizializza_database():
 
     # Anagrafica aggiornata con il doppio prezzo e soglia minima scorta
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS articoli (
-        codice TEXT PRIMARY KEY,
-        descrizione TEXT NOT NULL,
-        colore TEXT,
-        taglia TEXT,
-        prezzo_acquisto REAL,
-        prezzo_vendita REAL,
-        soglia_minima INTEGER DEFAULT 2
-    )
-    """)
+                   CREATE TABLE IF NOT EXISTS articoli (
+                                                           codice TEXT PRIMARY KEY,
+                                                           descrizione TEXT NOT NULL,
+                                                           colore TEXT,
+                                                           taglia TEXT,
+                                                           prezzo_acquisto REAL,
+                                                           prezzo_vendita REAL,
+                                                           soglia_minima INTEGER DEFAULT 2
+                   )
+                   """)
 
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS depositi (
-        id INTEGER PRIMARY KEY,
-        nome_deposito TEXT NOT NULL
-    )
-    """)
+                   CREATE TABLE IF NOT EXISTS depositi (
+                                                           id INTEGER PRIMARY KEY,
+                                                           nome_deposito TEXT NOT NULL
+                   )
+                   """)
 
     # Tabella Fornitori
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS fornitori (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ragione_sociale TEXT NOT NULL UNIQUE
-    )
-    """)
+                   CREATE TABLE IF NOT EXISTS fornitori (
+                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                            ragione_sociale TEXT NOT NULL UNIQUE
+                   )
+                   """)
 
     # Tabella Transazioni
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS transazioni (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data_ora DATETIME DEFAULT CURRENT_TIMESTAMP,
-        totale REAL NOT NULL,
-        metodo_pagamento TEXT
-    )
-    """)
+                   CREATE TABLE IF NOT EXISTS transazioni (
+                                                              id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                              data_ora DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                                              totale REAL NOT NULL,
+                                                              metodo_pagamento TEXT
+                   )
+                   """)
 
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS movimenti_magazzino (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        codice TEXT NOT NULL,
-        quantita INTEGER NOT NULL,
-        id_deposito_origine INTEGER,
-        id_deposito_destinazione INTEGER,
-        tipo INTEGER NOT NULL,
-        data_ora DATETIME DEFAULT CURRENT_TIMESTAMP,
-        id_fornitore INTEGER,
-        riferimento_bolla TEXT,
-        id_transazione INTEGER,
-        storico_passivo INTEGER DEFAULT 0,
-        FOREIGN KEY (codice) REFERENCES articoli (codice),
-        FOREIGN KEY (id_deposito_origine) REFERENCES depositi (id),
-        FOREIGN KEY (id_deposito_destinazione) REFERENCES depositi (id),
-        FOREIGN KEY (id_fornitore) REFERENCES fornitori (id),
-        FOREIGN KEY (id_transazione) REFERENCES transazioni (id)
-    )
-    """)
+                   CREATE TABLE IF NOT EXISTS movimenti_magazzino (
+                                                                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                      codice TEXT NOT NULL,
+                                                                      quantita INTEGER NOT NULL,
+                                                                      id_deposito_origine INTEGER,
+                                                                      id_deposito_destinazione INTEGER,
+                                                                      tipo INTEGER NOT NULL,
+                                                                      data_ora DATETIME DEFAULT CURRENT_TIMESTAMP,
+                                                                      id_fornitore INTEGER,
+                                                                      riferimento_bolla TEXT,
+                                                                      id_transazione INTEGER,
+                                                                      storico_passivo INTEGER DEFAULT 0,
+                                                                      nome_fornitore_storico TEXT,
+                                                                      FOREIGN KEY (codice) REFERENCES articoli (codice),
+                       FOREIGN KEY (id_deposito_origine) REFERENCES depositi (id),
+                       FOREIGN KEY (id_deposito_destinazione) REFERENCES depositi (id),
+                       FOREIGN KEY (id_fornitore) REFERENCES fornitori (id),
+                       FOREIGN KEY (id_transazione) REFERENCES transazioni (id)
+                       )
+                   """)
 
     cursor.execute("INSERT OR IGNORE INTO depositi (id, nome_deposito) VALUES (1, 'Negozio')")
     cursor.execute("INSERT OR IGNORE INTO depositi (id, nome_deposito) VALUES (2, 'Box')")
@@ -76,6 +77,7 @@ def inizializza_database():
     _migra_tracciamento_documentale(cursor)
     _migra_transazioni(cursor)
     _migra_storico_passivo(cursor)
+    _migra_nome_fornitore_storico(cursor)
 
     conn.commit()
     conn.close()
@@ -128,6 +130,16 @@ def _migra_storico_passivo(cursor):
     if 'storico_passivo' not in colonne:
         cursor.execute("ALTER TABLE movimenti_magazzino ADD COLUMN storico_passivo INTEGER DEFAULT 0")
         print("Migrazione: Aggiunta colonna 'storico_passivo' a movimenti_magazzino.")
+
+def _migra_nome_fornitore_storico(cursor):
+    """Aggiunge la colonna nome_fornitore_storico se non esiste.
+    Serve a preservare il nome del fornitore nei movimenti anche dopo
+    l'eliminazione del fornitore stesso dall'anagrafica."""
+    cursor.execute("PRAGMA table_info(movimenti_magazzino)")
+    colonne = [col[1] for col in cursor.fetchall()]
+    if 'nome_fornitore_storico' not in colonne:
+        cursor.execute("ALTER TABLE movimenti_magazzino ADD COLUMN nome_fornitore_storico TEXT")
+        print("Migrazione: Aggiunta colonna 'nome_fornitore_storico' a movimenti_magazzino.")
 
 
 if __name__ == '__main__':
