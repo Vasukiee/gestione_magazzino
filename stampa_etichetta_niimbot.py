@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Modulo per generare e stampare etichette a barcode (Code128) su NiimBot B1 Pro,
-collegata via cavo USB (porta seriale).
+Stampa etichette barcode Code128 su NiimBot B1 Pro via USB seriale.
 
-Il contenuto del barcode e' SEMPRE il campo `codice` dell'articolo (chiave
-primaria della tabella `articoli` in magazzino.db). Nessuna persistenza
-separata: l'etichetta viene generata al volo al momento della stampa.
+Il codice stampato è il campo `codice` dell'articolo (PK di `articoli`
+in magazzino.db). L'immagine viene generata al volo ad ogni stampa.
 
 Dipendenze:
     pip install niimprint pyserial python-barcode pillow
 
-Note collegamento:
-    - NiimBot B1 Pro collegata via cavo USB: /dev/ttyACM0 o /dev/ttyUSB0.
-    - L'utente deve essere nel gruppo "uucp" (Arch) o "dialout" (Debian/Ubuntu):
-          sudo usermod -aG uucp $USER
-      Poi logout/login, oppure udev rule con TAG+="uaccess".
+Permessi seriale (una tantum):
+    sudo usermod -aG uucp $USER    # Arch Linux
+    sudo usermod -aG dialout $USER # Debian / Ubuntu
+    # Poi logout/login per applicare il gruppo
+
+CLI:
+    python stampa_etichetta_niimbot.py <CODICE>   # stampa etichetta
+    python stampa_etichetta_niimbot.py test        # diagnostica strisce
+    python stampa_etichetta_niimbot.py nero        # diagnostica tutto nero
 """
 
 import io
@@ -31,74 +33,28 @@ from niimprint import PrinterClient, SerialTransport
 # ---------------------------------------------------------------------------
 # Configurazione stampante
 # ---------------------------------------------------------------------------
-PORTA_SERIALE  = "auto"
-DENSITA_STAMPA = 3   # 1–5; 3 è un buon default
-TIPO_ETICHETTA = 1   # 1 = etichetta con gap (la più comune)
+PORTA_SERIALE  = "auto"  # "auto" = rilevamento automatico, oppure "/dev/ttyACM0"
+DENSITA_STAMPA = 3       # densità di stampa 1–5 (3 = default)
 
 # ---------------------------------------------------------------------------
-# Geometria etichetta
+# Geometria etichetta — 3 × 5 cm, 300 DPI
 # ---------------------------------------------------------------------------
-#
-# HEAD_DOTS_PER_MM — risoluzione della testina (direzione larghezza etichetta).
-#   Confermato 300 DPI dalla scheda tecnica NiimBot B1 Pro.
-#   300 DPI / 25.4 mm/inch ≈ 11.81 dot/mm.
-#
-HEAD_DOTS_PER_MM = 300 / 25.4   # ≈ 11.81
+LABEL_W_MM  = 50          # larghezza etichetta (direzione testina)   = 5 cm
+LABEL_H_MM  = 30          # altezza etichetta  (direzione avanzamento) = 3 cm
+DPI         = 300
+DOTS_PER_MM = DPI / 25.4  # ≈ 11.81 dot/mm
+MARGIN_MM   = 2           # margine su ogni bordo in mm
 
-#
-# FEED_DOTS_PER_MM — risoluzione del motore (direzione avanzamento nastro).
-#
-#   ATTENZIONE: il motore del B1 Pro avanza a 600 DPI (23.62 step/mm), ma
-#   accetta esattamente LABEL_FEED_MM × HEAD_DOTS_PER_MM step per etichetta
-#   (≈354 step per 30mm). Inviare più di 354 righe causa troncamento.
-#
-#   Quindi FEED_DOTS_PER_MM DEVE restare uguale a HEAD_DOTS_PER_MM per
-#   mantenere l'altezza del canvas a 354 righe. I contenuti vengono fisicamente
-#   compressi 2:1 dal motore (15mm fisici per 354 righe). Questo è il limite
-#   hardware — non è modificabile via software senza supporto firmware.
-#
-FEED_DOTS_PER_MM = HEAD_DOTS_PER_MM   # NON cambiare: vedi nota sopra
+# ---------------------------------------------------------------------------
+# Orientamento — modificare solo se il risultato appare ruotato o capovolto
+# ---------------------------------------------------------------------------
+ROTATE_BARCODE = False  # True = ruota il barcode di 90° (barre orizzontali)
+FLIP_FEED      = True   # True = capovolge l'immagine prima della stampa
 
-# Alias mantenuto per compatibilità con eventuali riferimenti diretti.
-DOTS_PER_MM = HEAD_DOTS_PER_MM
-
-#
-# LABEL_HEAD_MM / LABEL_FEED_MM
-#   La libreria niimprint manda una scanline per ogni riga dell'immagine:
-#     image.width  = dot per scanline = ampiezza testina di stampa
-#     image.height = numero di scanline = dimensione lungo l'uscita nastro
-#
-#   Per etichetta 30 mm (altezza) × 50 mm (larghezza) su nastro da 50 mm:
-#     LABEL_HEAD_MM = 50  (attraversa la testina)
-#     LABEL_FEED_MM = 30  (direzione uscita nastro)
-#
-#   Se il barcode stampato è ruotato di 90°, scambia i due valori.
-#
-LABEL_HEAD_MM = 50
-LABEL_FEED_MM = 30
-MARGIN_MM     = 2    # margine su ogni bordo in mm
-
-#
-# ROTATE_BARCODE
-#   Il barcode Code128 è generato in landscape (barre verticali, lettura
-#   orizzontale). Con False viene inviato senza rotazione.
-#   Se le barre appaiono orizzontali sullo stampato, imposta True.
-#
-ROTATE_BARCODE = False
-
-#
-# FLIP_FEED
-#   Se True, l'immagine viene capovolta (ruotata 180°) prima della stampa.
-#   Prova: True se il contenuto appare al bordo sbagliato dell'etichetta.
-#
-FLIP_FEED = True
-
-#
-# DEBUG_SAVE_IMAGE
-#   Se True, l'immagine generata viene salvata in /tmp/ prima della stampa.
-#   Utile per verificare la composizione senza sprecare etichette.
-#
-DEBUG_SAVE_IMAGE = False
+# ---------------------------------------------------------------------------
+# Debug
+# ---------------------------------------------------------------------------
+DEBUG_SAVE_IMAGE = False  # True = salva PNG in /tmp/ e salta la stampa reale
 
 
 # ---------------------------------------------------------------------------
@@ -106,41 +62,40 @@ DEBUG_SAVE_IMAGE = False
 # ---------------------------------------------------------------------------
 
 def _trova_porta_stampante() -> str:
-    """Rileva la porta seriale USB reale, ignorando le porte ttyS fantasma."""
-    porte_reali = [p for p, _d, hwid in list_comports() if hwid != "n/a"]
-    if len(porte_reali) == 1:
-        return porte_reali[0]
-    if not porte_reali:
+    """Individua la porta seriale USB della stampante, ignorando le porte fantasma."""
+    porte = [p for p, _d, hwid in list_comports() if hwid != "n/a"]
+    if len(porte) == 1:
+        return porte[0]
+    if not porte:
         raise RuntimeError(
             "Nessuna porta seriale USB trovata. "
-            "Controllare il collegamento della stampante."
+            "Verificare il cavo e i permessi (gruppo uucp/dialout)."
         )
     raise RuntimeError(
-        f"Più porte seriali USB trovate: {porte_reali}. "
-        "Specificare PORTA_SERIALE manualmente."
+        f"Più porte seriali rilevate: {porte}. "
+        "Impostare PORTA_SERIALE manualmente."
     )
 
 
 def _log_info_stampante(client: PrinterClient) -> None:
-    """Interroga la stampante e stampa su stderr le info disponibili."""
+    """Stampa su stdout le informazioni di base della stampante."""
     from niimprint.printer import InfoEnum
-    labels = {
+    campi = {
         "DEVICETYPE":  InfoEnum.DEVICETYPE,
         "HARDVERSION": InfoEnum.HARDVERSION,
         "SOFTVERSION": InfoEnum.SOFTVERSION,
         "BATTERY":     InfoEnum.BATTERY,
     }
-    info = {}
-    for nome, chiave in labels.items():
+    info = {nome: "n/a" for nome in campi}
+    for nome, chiave in campi.items():
         try:
             info[nome] = client.get_info(chiave)
         except Exception:
-            info[nome] = "n/a"
+            pass
     print(
         f"[niimbot] DEVICETYPE={info['DEVICETYPE']}  "
         f"HW={info['HARDVERSION']}  SW={info['SOFTVERSION']}  "
-        f"BATTERY={info['BATTERY']}  "
-        f"DOTS_PER_MM={DOTS_PER_MM:.2f}",
+        f"BATTERY={info['BATTERY']}  DPI={DPI}",
         flush=True,
     )
 
@@ -151,124 +106,6 @@ def _connetti_stampante() -> PrinterClient:
     client = PrinterClient(transport)
     _log_info_stampante(client)
     return client
-
-
-def _genera_barcode_px(
-    codice: str,
-    canvas_w: int,
-    canvas_h: int,
-    target_w: int,
-    target_h: int,
-) -> Image.Image:
-    """
-    Nucleo di generazione barcode. Restituisce un canvas PIL di (canvas_w × canvas_h)
-    con il barcode centrato, largo target_w e alto target_h.
-
-    Strategia resize:
-    - Prima passata con module_width=1.0 mm per misurare la larghezza di riferimento.
-    - Seconda passata con module_width scalato → il barcode esce già vicino a
-      target_w, minimizzando il resize sull'asse di lettura (quello critico).
-    - Solo l'altezza (non critica) viene forzata a target_h con NEAREST.
-    """
-    # Prima passata: misura la larghezza a module_width di riferimento
-    opts_ref = {"module_width": 1.0, "module_height": 10.0,
-                "quiet_zone": 4, "write_text": False}
-    c_ref = barcode.get("code128", codice, writer=ImageWriter())
-    buf_ref = io.BytesIO()
-    c_ref.write(buf_ref, options=opts_ref)
-    buf_ref.seek(0)
-    ref_w = Image.open(buf_ref).size[0]
-
-    # Seconda passata: module_width calibrato per avvicinarsi a target_w
-    module_w = 1.0 * target_w / ref_w
-    opts = {
-        "module_width":  module_w,
-        "module_height": 15.0,
-        "font_size":     9,
-        "text_distance": 3,
-        "quiet_zone":    4,
-        "write_text":    True,
-    }
-    c = barcode.get("code128", codice, writer=ImageWriter())
-    buf = io.BytesIO()
-    c.write(buf, options=opts)
-    buf.seek(0)
-    src = Image.open(buf).convert("L")
-
-    if ROTATE_BARCODE:
-        src = src.rotate(-90, expand=True)
-
-    bcode_w = src.size[0]
-    if bcode_w > canvas_w:
-        src = src.resize((canvas_w, target_h), Image.NEAREST)
-        bcode_w = canvas_w
-    else:
-        src = src.resize((bcode_w, target_h), Image.NEAREST)
-
-    # Soglia hard B/N (NEAREST può lasciare grigi sul testo renderizzato)
-    src = src.point(lambda p: 255 if p > 128 else 0)
-
-    canvas = Image.new("L", (canvas_w, canvas_h), 255)
-    off_x  = (canvas_w - bcode_w) // 2
-    off_y  = (canvas_h - target_h) // 2
-    canvas.paste(src, (off_x, off_y))
-    return canvas
-
-
-# ---------------------------------------------------------------------------
-# API pubblica
-# ---------------------------------------------------------------------------
-
-def genera_immagine_barcode(codice: str) -> Image.Image:
-    """Genera l'immagine etichetta con un singolo barcode a piena area."""
-    head_px  = round(LABEL_HEAD_MM * HEAD_DOTS_PER_MM)
-    feed_px  = round(LABEL_FEED_MM * FEED_DOTS_PER_MM)
-    tgt_head = round((LABEL_HEAD_MM - 2 * MARGIN_MM) * HEAD_DOTS_PER_MM)
-    tgt_feed = round((LABEL_FEED_MM - 2 * MARGIN_MM) * FEED_DOTS_PER_MM)
-    return _genera_barcode_px(codice, head_px, feed_px, tgt_head, tgt_feed)
-
-
-def genera_immagine_doppio_barcode(codice1: str, codice2: str) -> Image.Image:
-    """
-    Genera un'etichetta con due barcode impilati verticalmente.
-
-    Il canvas è 591×354 (50mm×30mm a 300 DPI). Il motore del B1 Pro
-    avanza a 600 DPI, quindi fisicamente vengono stampati solo ~15mm
-    di nastro per etichetta: non superare 354 righe nel canvas.
-
-    Layout (margini minimi per massimizzare le barre):
-    ┌──────────────────────────┐  y=0
-    │  [BARCODE  codice1]      │  y=4..172  (168 px ≈ 7mm fisici)
-    ├──────────────────────────┤  y=174-178 separatore
-    │  [BARCODE  codice2]      │  y=180..348 (168 px ≈ 7mm fisici)
-    └──────────────────────────┘  y=354
-    """
-    head_px  = round(LABEL_HEAD_MM * HEAD_DOTS_PER_MM)
-    feed_px  = round(LABEL_FEED_MM * FEED_DOTS_PER_MM)
-    tgt_head = round((LABEL_HEAD_MM - 2 * MARGIN_MM) * HEAD_DOTS_PER_MM)
-
-    # Margini minimi: 0.3mm esterno (4 px), 0.5mm interno (6 px per lato)
-    outer_px = 4
-    inner_px = 6
-    mid_y    = feed_px // 2
-
-    top_h    = mid_y - outer_px - inner_px
-    bottom_h = (feed_px - mid_y) - outer_px - inner_px
-
-    top_img    = _genera_barcode_px(codice1, head_px, top_h,    tgt_head, top_h)
-    bottom_img = _genera_barcode_px(codice2, head_px, bottom_h, tgt_head, bottom_h)
-
-    canvas = Image.new("L", (head_px, feed_px), 255)
-    canvas.paste(top_img,    (0, outer_px))
-    canvas.paste(bottom_img, (0, mid_y + inner_px))
-
-    # Separatore centrale: 3 righe visibili (scuro/bianco/scuro)
-    draw = ImageDraw.Draw(canvas)
-    draw.line([(0, mid_y - 2), (head_px - 1, mid_y - 2)], fill=60,  width=1)
-    draw.line([(0, mid_y - 1), (head_px - 1, mid_y - 1)], fill=200, width=1)
-    draw.line([(0, mid_y),     (head_px - 1, mid_y)],     fill=60,  width=1)
-
-    return canvas
 
 
 def _debug_salva_immagine(immagine: Image.Image, nome: str) -> None:
@@ -282,11 +119,77 @@ def _debug_salva_immagine(immagine: Image.Image, nome: str) -> None:
 
 
 def _prepara_per_stampa(img: Image.Image) -> Image.Image:
-    """Applica trasformazioni pre-stampa (es. flip) secondo la configurazione."""
+    """Applica l'eventuale ribaltamento pre-stampa."""
     if FLIP_FEED:
         img = img.rotate(180)
     return img
 
+
+# ---------------------------------------------------------------------------
+# Generazione immagine
+# ---------------------------------------------------------------------------
+
+def genera_immagine_barcode(codice: str) -> Image.Image:
+    """
+    Restituisce un canvas PIL in scala di grigi con il barcode Code128 centrato.
+
+    Dimensioni canvas: LABEL_W_MM × LABEL_H_MM a DOTS_PER_MM dot/mm.
+    Il barcode occupa l'area al netto di MARGIN_MM su ogni lato.
+
+    Approccio two-pass:
+      1. Genera a module_width=1.0 per misurare la larghezza prodotta.
+      2. Scala module_width proporzionalmente → il barcode esce già vicino
+         alla larghezza target, minimizzando il resize sulle barre.
+      3. Ridimensiona solo l'altezza (non critica per la leggibilità).
+    """
+    canvas_w = round(LABEL_W_MM * DOTS_PER_MM)
+    canvas_h = round(LABEL_H_MM * DOTS_PER_MM)
+    target_w = round((LABEL_W_MM - 2 * MARGIN_MM) * DOTS_PER_MM)
+    target_h = round((LABEL_H_MM - 2 * MARGIN_MM) * DOTS_PER_MM)
+
+    # Prima passata: misura larghezza prodotta a module_width di riferimento
+    buf = io.BytesIO()
+    barcode.get("code128", codice, writer=ImageWriter()).write(
+        buf, options={"module_width": 1.0, "module_height": 10.0,
+                      "quiet_zone": 4, "write_text": False}
+    )
+    buf.seek(0)
+    ref_w = Image.open(buf).size[0]
+
+    # Seconda passata: module_width scalato per coprire target_w
+    buf = io.BytesIO()
+    barcode.get("code128", codice, writer=ImageWriter()).write(
+        buf, options={
+            "module_width":  target_w / ref_w,
+            "module_height": 15.0,
+            "quiet_zone":    4,
+            "write_text":    True,
+            "font_size":     9,
+            "text_distance": 3,
+        }
+    )
+    buf.seek(0)
+    src = Image.open(buf).convert("L")
+
+    if ROTATE_BARCODE:
+        src = src.rotate(-90, expand=True)
+
+    # Se il barcode supera il canvas, clampa la larghezza; ridimensiona l'altezza
+    bcode_w = min(src.size[0], canvas_w)
+    src = src.resize((bcode_w, target_h), Image.NEAREST)
+
+    # Converti in B/N netto (le stampanti termiche non usano grigi)
+    src = src.point(lambda p: 255 if p > 128 else 0)
+
+    # Centra nel canvas su sfondo bianco
+    canvas = Image.new("L", (canvas_w, canvas_h), 255)
+    canvas.paste(src, ((canvas_w - bcode_w) // 2, (canvas_h - target_h) // 2))
+    return canvas
+
+
+# ---------------------------------------------------------------------------
+# API pubblica
+# ---------------------------------------------------------------------------
 
 def stampa_etichetta_articolo(codice: str) -> tuple[bool, str]:
     """
@@ -295,11 +198,11 @@ def stampa_etichetta_articolo(codice: str) -> tuple[bool, str]:
     """
     try:
         immagine = genera_immagine_barcode(codice)
-        _debug_salva_immagine(immagine, "singolo")
-        print(f"[stampa] singolo  image.size={immagine.size}  (width x height)", flush=True)
+        _debug_salva_immagine(immagine, codice)
+        print(f"[stampa] {codice}  canvas={immagine.size}", flush=True)
 
         if DEBUG_SAVE_IMAGE:
-            return True, f"[DEBUG] Immagine '{codice}' generata e salvata, stampa reale saltata (DEBUG_SAVE_IMAGE=True)."
+            return True, "[DEBUG] Immagine generata e salvata, stampa reale saltata."
 
         client = _connetti_stampante()
         client.print_image(_prepara_per_stampa(immagine), density=DENSITA_STAMPA)
@@ -309,52 +212,30 @@ def stampa_etichetta_articolo(codice: str) -> tuple[bool, str]:
         return False, f"Errore durante la stampa: {e}"
 
 
-
-def stampa_doppio_barcode(codice1: str, codice2: str) -> tuple[bool, str]:
-    """
-    Genera un'etichetta con due barcode (codice1 in alto, codice2 in basso)
-    e la invia alla NiimBot B1 Pro.
-    Ritorna (successo: bool, messaggio: str).
-    """
-    try:
-        immagine = genera_immagine_doppio_barcode(codice1, codice2)
-        _debug_salva_immagine(immagine, "doppio")
-        print(f"[stampa] doppio   image.size={immagine.size}  (width x height)", flush=True)
-        client = _connetti_stampante()
-        client.print_image(_prepara_per_stampa(immagine), density=DENSITA_STAMPA)
-        return True, f"Etichetta doppia '{codice1}' + '{codice2}' stampata."
-    except Exception as e:
-        traceback.print_exc()
-        return False, f"Errore durante la stampa: {e}"
-
+# ---------------------------------------------------------------------------
+# Funzioni diagnostiche
+# ---------------------------------------------------------------------------
 
 def stampa_test_strisce() -> tuple[bool, str]:
     """
-    Stampa un'immagine diagnostica con 3 strisce nere a posizioni note nel canvas:
-      Striscia A: y=0..9    (bordo SUPERIORE del canvas)
-      Striscia B: y=172..181 (CENTRO del canvas)
-      Striscia C: y=344..353 (bordo INFERIORE del canvas)
+    Stampa tre strisce nere in posizioni note nel canvas:
+      A — bordo superiore  (y = 0 .. 9)
+      B — centro           (y = canvas_h//2 - 5 .. canvas_h//2 + 4)
+      C — bordo inferiore  (y = canvas_h-10 .. canvas_h-1)
 
-    Osserva sull'etichetta fisica:
-    - Quante strisce compaiono?
-    - In che ordine dal bordo d'uscita verso l'alto?
-    - Quanto sono fisicamente distanti?
-
-    Questo rivela orientamento e scala DPI effettivi.
+    Permette di misurare orientamento e scala DPI reali sull'etichetta fisica.
     """
     try:
-        head_px = round(LABEL_HEAD_MM * HEAD_DOTS_PER_MM)
-        feed_px = round(LABEL_FEED_MM * FEED_DOTS_PER_MM)
-        img = Image.new("L", (head_px, feed_px), 255)
+        canvas_w = round(LABEL_W_MM * DOTS_PER_MM)
+        canvas_h = round(LABEL_H_MM * DOTS_PER_MM)
+        mid = canvas_h // 2
+        img = Image.new("L", (canvas_w, canvas_h), 255)
         draw = ImageDraw.Draw(img)
-        # Striscia A — bordo superiore
-        draw.rectangle([(0, 0),   (head_px - 1, 9)],   fill=0)
-        # Striscia B — centro
-        draw.rectangle([(0, 172), (head_px - 1, 181)],  fill=0)
-        # Striscia C — bordo inferiore
-        draw.rectangle([(0, 344), (head_px - 1, 353)],  fill=0)
-        print(f"[test] immagine strisce: {img.size}", flush=True)
-        _debug_salva_immagine(img, "strisce")
+        draw.rectangle([(0, 0),          (canvas_w - 1, 9)],              fill=0)  # A
+        draw.rectangle([(0, mid - 5),    (canvas_w - 1, mid + 4)],        fill=0)  # B
+        draw.rectangle([(0, canvas_h - 10), (canvas_w - 1, canvas_h - 1)], fill=0) # C
+        print(f"[test] strisce  canvas={img.size}  mid={mid}", flush=True)
+        _debug_salva_immagine(img, "test_strisce")
         client = _connetti_stampante()
         client.print_image(_prepara_per_stampa(img), density=DENSITA_STAMPA)
         return True, "Test strisce inviato."
@@ -364,18 +245,13 @@ def stampa_test_strisce() -> tuple[bool, str]:
 
 
 def stampa_test_nero_totale() -> tuple[bool, str]:
-    """
-    Stampa un canvas completamente nero (591×354).
-    Se tutta l'etichetta diventa nera → il canvas copre l'intera etichetta.
-    Se solo una fascia è nera → quella fascia è l'area effettivamente stampata.
-    Misura la fascia nera con un righello per ottenere mm/canvas.
-    """
+    """Canvas completamente nero: verifica che l'area stampata coincida con il canvas."""
     try:
-        head_px = round(LABEL_HEAD_MM * HEAD_DOTS_PER_MM)
-        feed_px = round(LABEL_FEED_MM * FEED_DOTS_PER_MM)
-        img = Image.new("L", (head_px, feed_px), 0)   # tutto nero
-        print(f"[test] rettangolo nero: {img.size}", flush=True)
-        _debug_salva_immagine(img, "nero")
+        canvas_w = round(LABEL_W_MM * DOTS_PER_MM)
+        canvas_h = round(LABEL_H_MM * DOTS_PER_MM)
+        img = Image.new("L", (canvas_w, canvas_h), 0)
+        print(f"[test] nero totale  canvas={img.size}", flush=True)
+        _debug_salva_immagine(img, "test_nero")
         client = _connetti_stampante()
         client.print_image(_prepara_per_stampa(img), density=DENSITA_STAMPA)
         return True, "Test nero totale inviato."
@@ -386,14 +262,21 @@ def stampa_test_nero_totale() -> tuple[bool, str]:
 
 if __name__ == "__main__":
     import sys
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "singolo"
+
+    if len(sys.argv) < 2:
+        print("Uso:")
+        print("  python stampa_etichetta_niimbot.py <CODICE>   # stampa etichetta")
+        print("  python stampa_etichetta_niimbot.py test        # diagnostica strisce")
+        print("  python stampa_etichetta_niimbot.py nero        # diagnostica nero totale")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
     if cmd == "test":
         ok, msg = stampa_test_strisce()
     elif cmd == "nero":
         ok, msg = stampa_test_nero_totale()
-    elif cmd == "doppio" and len(sys.argv) >= 4:
-        ok, msg = stampa_doppio_barcode(sys.argv[2], sys.argv[3])
     else:
-        codice_test = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != "singolo" else "TEST001"
-        ok, msg = stampa_etichetta_articolo(codice_test)
+        ok, msg = stampa_etichetta_articolo(cmd)
+
     print(msg)
+    sys.exit(0 if ok else 1)
