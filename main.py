@@ -12,6 +12,7 @@ import glob
 import signal
 import sys
 from setup_db import inizializza_database
+from stampa_etichetta_niimbot import stampa_etichetta_articolo, stampa_doppio_barcode
 
 class TerminaleMagazzino:
     def __init__(self, root):
@@ -29,6 +30,8 @@ class TerminaleMagazzino:
         self.totale_carrello_str = tk.StringVar(value="€ 0.00")
         self.totale_carrello_val = 0.0
         self.movimenti_log = {}  # id riga tree_log -> id movimento in movimenti_magazzino (per annullamento)
+
+        self._pending_doppio_codice1 = None   # codice in attesa per stampa doppia
 
         self.setup_cartelle_backup()
 
@@ -245,6 +248,18 @@ class TerminaleMagazzino:
         self.entry_codice_trasf.bind('<Return>', self.esegui_trasferimento)
 
     def setup_tab_ricerca(self):
+        # Banner stampa doppia — visibile solo quando _pending_doppio_codice1 è attivo.
+        # Packed per primo così resta sempre in cima alla scheda.
+        self._banner_doppio_var = tk.StringVar(value="")
+        self._lbl_banner_doppio = ttk.Label(
+            self.tab_ricerca,
+            textvariable=self._banner_doppio_var,
+            bootstyle="warning-inverse",
+            font=('Helvetica', 11, 'bold'),
+            anchor='center',
+        )
+        self._lbl_banner_doppio.pack(fill=tk.X)
+
         search_top = ttk.Frame(self.tab_ricerca)
         search_top.pack(fill=tk.X, pady=(0, 10))
 
@@ -297,8 +312,11 @@ class TerminaleMagazzino:
         self.menu_contestuale = tk.Menu(self.root, tearoff=0)
         self.menu_contestuale.add_command(label="Modifica / Rettifica", command=self.apri_modifica)
         self.menu_contestuale.add_command(label="Elimina Intero Record", command=self.elimina_selezionato)
+        self.menu_contestuale.add_separator()
+        self.menu_contestuale.add_command(label="Stampa Etichetta Barcode", command=self.stampa_etichetta_selezionata)
 
-        self.tree_ricerca.bind("<Button-3>", self.mostra_menu_contestuale)
+        self.tree_ricerca.bind("<ButtonRelease-3>", self.mostra_menu_contestuale)
+        self.tree_ricerca.bind("<Double-Button-1>", self._on_doppio_clic_ricerca)
 
     def mostra_menu_contestuale(self, event):
         item = self.tree_ricerca.identify_row(event.y)
@@ -306,6 +324,151 @@ class TerminaleMagazzino:
             self.tree_ricerca.selection_set(item)
             self.tree_ricerca.focus(item)
             self.menu_contestuale.tk_popup(event.x_root, event.y_root)
+
+    def stampa_etichetta_selezionata(self):
+        selected = self.tree_ricerca.focus()
+        if not selected:
+            return
+        valori = self.tree_ricerca.item(selected)['values']
+        codice = str(valori[0])
+        self._scegli_modalita_stampa(codice)
+
+    def _fine_stampa_etichetta(self, successo, messaggio):
+        if successo:
+            messagebox.showinfo("Stampa completata", messaggio)
+        else:
+            messagebox.showerror("Errore di stampa", messaggio)
+
+    def _chiedi_stampa_etichetta(self, codice):
+        self._scegli_modalita_stampa(codice)
+
+    # ------------------------------------------------------------------
+    # Gestione pending stampa doppia
+    # ------------------------------------------------------------------
+
+    def _attiva_pending_doppio(self, codice: str):
+        """Entra in modalità 'attesa secondo articolo' per la stampa doppia."""
+        self._pending_doppio_codice1 = codice
+        self._banner_doppio_var.set(
+            f"  STAMPA DOPPIA IN ATTESA  |  Codice 1: {codice}"
+            "  |  Doppio clic sull'articolo da aggiungere  |  Esc per annullare  "
+        )
+        self.notebook.select(self.tab_ricerca)
+        self.tab_ricerca.bind('<Escape>', self._annulla_pending_doppio)
+        self.tree_ricerca.focus_set()
+
+    def _cancella_pending_doppio(self):
+        """Esce dalla modalità attesa senza stampare."""
+        self._pending_doppio_codice1 = None
+        self._banner_doppio_var.set("")
+        self.tab_ricerca.unbind('<Escape>')
+
+    def _annulla_pending_doppio(self, *_):
+        self._cancella_pending_doppio()
+
+    def _on_doppio_clic_ricerca(self, event):
+        """Doppio clic su tree_ricerca: se pending doppio, chiede conferma secondo articolo."""
+        if self._pending_doppio_codice1 is None:
+            return
+        item = self.tree_ricerca.identify_row(event.y)
+        if not item:
+            return
+        val = self.tree_ricerca.item(item)['values']
+        codice2 = str(val[0])
+        desc2   = val[1] if len(val) > 1 else ""
+        risposta = messagebox.askyesno(
+            "Conferma secondo articolo",
+            f"Aggiungi '{codice2} — {desc2}' come secondo codice sull'etichetta?\n"
+            f"(Primo codice: {self._pending_doppio_codice1})",
+        )
+        if not risposta:
+            return
+        codice1 = self._pending_doppio_codice1
+        self._cancella_pending_doppio()
+        def esegui():
+            ok, msg = stampa_doppio_barcode(codice1, codice2)
+            self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
+        threading.Thread(target=esegui, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Dialog scelta modalità stampa
+    # ------------------------------------------------------------------
+
+    def _scegli_modalita_stampa(self, codice: str):
+        """
+        Dialog con radio button per scegliere la modalità di stampa.
+        Per 'secondo articolo diverso': chiude il dialog e attiva la modalità
+        pending (doppio clic sull'articolo desiderato nella tab Ricerca).
+        """
+        popup = tk.Toplevel(self.root)
+        popup.title("Stampa etichetta")
+        popup.resizable(False, False)
+        popup.grab_set()
+
+        ttk.Label(
+            popup,
+            text=f"Articolo: {codice}",
+            font=('Helvetica', 12, 'bold'),
+        ).pack(pady=(18, 6), padx=20, anchor=tk.W)
+
+        ttk.Label(
+            popup, text="Modalità di stampa:",
+        ).pack(padx=20, anchor=tk.W)
+
+        modalita = tk.StringVar(value="singolo")
+
+        frame_radio = ttk.Frame(popup)
+        frame_radio.pack(fill=tk.X, padx=24, pady=6)
+
+        ttk.Radiobutton(
+            frame_radio, text="Solo questo codice (una copia)",
+            variable=modalita, value="singolo", bootstyle="primary",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            frame_radio, text="Stesso codice due volte (due copie sullo stesso foglio)",
+            variable=modalita, value="stesso", bootstyle="primary",
+        ).pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            frame_radio, text="Secondo articolo diverso (scegli dalla lista)",
+            variable=modalita, value="diverso", bootstyle="primary",
+        ).pack(anchor=tk.W, pady=3)
+
+        ttk.Label(
+            popup,
+            text="Per 'articolo diverso': dopo aver confermato,\n"
+                 "torna nella lista e fai doppio clic sul secondo articolo.",
+            bootstyle="secondary",
+            font=('Helvetica', 9),
+        ).pack(padx=20, pady=(4, 0), anchor=tk.W)
+
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(pady=16)
+
+        def _conferma(*_):
+            modo = modalita.get()
+            popup.destroy()
+            if modo == "singolo":
+                def esegui():
+                    ok, msg = stampa_etichetta_articolo(codice)
+                    self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
+                threading.Thread(target=esegui, daemon=True).start()
+            elif modo == "stesso":
+                def esegui():
+                    ok, msg = stampa_doppio_barcode(codice, codice)
+                    self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
+                threading.Thread(target=esegui, daemon=True).start()
+            else:
+                self._attiva_pending_doppio(codice)
+
+        ttk.Button(
+            btn_frame, text="Annulla", command=popup.destroy,
+            bootstyle="secondary",
+        ).pack(side=tk.LEFT, padx=10)
+        ttk.Button(
+            btn_frame, text="Conferma", command=_conferma,
+            bootstyle="success",
+        ).pack(side=tk.LEFT, padx=10)
+        popup.bind('<Return>', _conferma)
 
     def apri_modifica(self):
         selected = self.tree_ricerca.focus()
@@ -622,6 +785,22 @@ class TerminaleMagazzino:
         self.root.after(150, ripristina)
 
     def on_tab_changed(self, event):
+        # Se c'è una stampa doppia in attesa, intercetta il cambio scheda
+        if self._pending_doppio_codice1 is not None:
+            current = event.widget.select()
+            ricerca_idx = self.notebook.index(self.tab_ricerca)
+            if event.widget.index(current) != ricerca_idx:
+                annulla = messagebox.askyesno(
+                    "Coda di stampa attiva",
+                    "È in attesa la selezione del secondo articolo per la stampa doppia.\n"
+                    "Vuoi annullare la coda di stampa e cambiare scheda?",
+                )
+                if annulla:
+                    self._cancella_pending_doppio()
+                else:
+                    self.notebook.select(self.tab_ricerca)
+                    return
+
         tab = event.widget.tab('current')['text']
         if "Statistiche" in tab:
             self.aggiorna_statistiche()
@@ -1158,12 +1337,14 @@ class TerminaleMagazzino:
                 self.var_qta.set(1)
                 item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"AGGIUNTO AL CARRELLO - {desc}")
                 popup.destroy()
+                self._chiedi_stampa_etichetta(codice)
                 return
 
             self.conn.commit()
 
             self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, desc, qta, colore_val, taglia_val, id_fornitore, bolla)
             popup.destroy()
+            self._chiedi_stampa_etichetta(codice)
 
         ttk.Button(popup, text="Salva", command=salva, bootstyle="success").pack(pady=10)
         popup.bind('<Return>', salva)
