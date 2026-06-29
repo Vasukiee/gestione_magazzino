@@ -8,3 +8,19 @@ pip install ttkbootstrap
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now spegnimento-negozio.timer
+
+Stampa etichette NiimBot B1 Pro (USB seriale)
+
+Dipendenze Python da installare nel venv del progetto:
+pip install niimprint pyserial python-barcode pillow
+
+Permessi porta seriale (eseguire una volta, poi fare logout/login):
+sudo usermod -aG uucp $USER
+
+Soluzione permanente senza logout — regola udev che assegna automaticamente i permessi all'utente della sessione grafica:
+echo 'KERNEL=="ttyACM[0-9]*", SUBSYSTEM=="tty", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-niimbot.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger /dev/ttyACM0
+
+La stampante viene riconosciuta come /dev/ttyACM0. Il rilevamento automatico della porta è abilitato (PORTA_SERIALE = "auto" in stampa_etichetta_niimbot.py): funziona se la NiimBot è l'unico dispositivo USB seriale collegato. In caso contrario, specificare la porta manualmente nel file.
+
+Su distribuzioni non-Arch il gruppo potrebbe chiamarsi dialout invece di uucp — verificare con ls -la /dev/ttyACM0.
