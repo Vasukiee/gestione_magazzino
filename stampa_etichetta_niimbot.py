@@ -27,7 +27,7 @@ import traceback
 
 import barcode
 from barcode.writer import ImageWriter
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from serial.tools.list_ports import comports as list_comports
 
 from niimprint import PrinterClient, SerialTransport
@@ -138,6 +138,9 @@ def _connetti_stampante() -> PrinterClient:
     except Exception:
         pass
     client = PrinterClient(transport)
+    # Piccola pausa dopo il flush per lasciare il tempo alla stampante
+    # di tornare in stato idle prima del primo comando.
+    time.sleep(0.3)
     _log_info_stampante(client)
     return client
 
@@ -191,12 +194,37 @@ def _invia_immagine(client: PrinterClient, img: Image.Image, density: int) -> No
     # --- Init ---
     client.set_label_density(density)
     client.set_label_type(1)
-    # PrintStart V4 (9 byte): pagine=1, speed=density, resto padding
-    transceive(0x01, struct.pack(">H5BBB", 1, 0, 0, 0, 0, 0, density, 0))
+    # PrintStart V4 (9 byte). Riprova fino a 3 volte se la stampante
+    # restituisce un errore (es. buffer sporco o in stato di errore).
+    ps_data = struct.pack(">H5BBB", 1, 0, 0, 0, 0, 0, density, 0)
+    for _attempt in range(3):
+        try:
+            transceive(0x01, ps_data)
+            break
+        except ValueError:
+            print(f"[niimbot] PrintStart fallito (tentativo {_attempt+1}/3). Provo a resettare la stampante...", flush=True)
+            if _attempt == 2:
+                raise
+            # Invia comandi di clear task e end print per sbloccare la stampante
+            try:
+                invia(0xF3, b"\x01")  # EndPrint
+                invia(0x20, b"\x01")  # AllowPrintClear
+                client._transport._serial.reset_input_buffer()
+                client._transport._serial.reset_output_buffer()
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     # --- Pagina ---
     # SetPageSize V4 (13 byte): righe(H), colonne(W), costante 00 01, padding
-    transceive(0x13, struct.pack(">HHBB7B", h, w, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0))
+    for _attempt in range(3):
+        try:
+            transceive(0x13, struct.pack(">HHBB7B", h, w, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0))
+            break
+        except ValueError:
+            if _attempt == 2:
+                raise
+            time.sleep(0.3)
     # PrintStatus (0xA3): nel flusso V4 si interroga lo stato senza attendere,
     # niimprint non lo richiede come ack quindi inviamo il pacchetto raw.
     try:
@@ -250,6 +278,54 @@ def _prepara_per_stampa(img: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
+# Funzioni ausiliarie per il testo
+# ---------------------------------------------------------------------------
+
+def _get_font(size: int):
+    """Carica un font monospace TrueType alla dimensione richiesta."""
+    percorsi = [
+        "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",            # Arch Linux
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",                 # Arch Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", # Debian/Ubuntu
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",      # Debian/Ubuntu
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ]
+    for p in percorsi:
+        try:
+            return ImageFont.truetype(p, size)
+        except (OSError, IOError):
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _render_text(codice: str, max_w: int, size: int = 80) -> Image.Image:
+    """Renderizza il codice come immagine B/N, contenuta entro max_w pixel."""
+    font = _get_font(size)
+    try:
+        left, top, right, bottom = font.getbbox(codice)
+        tw, th = right - left, bottom - top
+    except AttributeError:
+        tw, th = font.getsize(codice)
+        left, top = 0, 0
+
+    txt_img = Image.new("L", (tw + 4, th + 4), 255)
+    ImageDraw.Draw(txt_img).text((-left + 2, -top + 2), codice, font=font, fill=0)
+    bbox_txt = ImageOps.invert(txt_img).getbbox()
+    if bbox_txt:
+        txt_img = txt_img.crop(bbox_txt)
+
+    if txt_img.width > max_w:
+        ratio = max_w / txt_img.width
+        txt_img = txt_img.resize((max_w, max(1, int(txt_img.height * ratio))), Image.LANCZOS)
+
+    return txt_img.point(lambda p: 255 if p > 128 else 0)
+
+
+# ---------------------------------------------------------------------------
 # Generazione immagine
 # ---------------------------------------------------------------------------
 
@@ -291,16 +367,16 @@ def genera_immagine_barcode(codice: str) -> Image.Image:
     buf.seek(0)
     ref_w = Image.open(buf).size[0]
 
-    # Seconda passata: module_width scalato per coprire target_w
+    # Seconda passata: module_width scalato per coprire target_w.
+    # Identica all'originale (write_text=True) per mantenere la stessa
+    # dimensione delle barre che funzionava correttamente.
     buf = io.BytesIO()
     barcode.get("code128", codice, writer=ImageWriter()).write(
         buf, options={
             "module_width":  target_w / ref_w,
             "module_height": 30.0,
             "quiet_zone":    4,
-            "write_text":    True,
-            "font_size":     7,
-            "text_distance": 2,
+            "write_text":    False,
         }
     )
     buf.seek(0)
@@ -309,19 +385,84 @@ def genera_immagine_barcode(codice: str) -> Image.Image:
     if ROTATE_BARCODE:
         src = src.rotate(-90, expand=True)
 
-    # Se il barcode supera il canvas, clampa la larghezza; ridimensiona l'altezza
+    # Barre ridimensionate esattamente a target_h — stessa dimensione dell'originale.
     bcode_w = min(src.size[0], canvas_w)
     src = src.resize((bcode_w, target_h), Image.NEAREST)
-
-    # Converti in B/N netto (le stampanti termiche non usano grigi)
     src = src.point(lambda p: 255 if p > 128 else 0)
 
-    # Posiziona nel canvas: barcode con margine in alto (MARGIN_MM) più
-    # l'eventuale offset di feed (positivo = più in basso).
     canvas = Image.new("L", (canvas_w, canvas_h), 255)
     pos_y = round((MARGIN_MM + max(0, OFFSET_FEED_MM)) * FEED_DOTS_PER_MM)
     pos_y = max(0, min(canvas_h - target_h, pos_y))
     canvas.paste(src, ((canvas_w - bcode_w) // 2, pos_y))
+
+    # Testo leggibile aggiunto nel canvas bianco SOTTO le barre.
+    # Usa il bianco già presente (target_h ≈ 400 px su 1200 totali);
+    # non modifica la dimensione delle barre.
+    txt_size = round(FEED_DOTS_PER_MM * 3.5)  # ~3.5 mm fisici ≈ 140 px
+    txt_img = _render_text(codice, bcode_w, size=txt_size)
+    txt_x = (canvas_w - txt_img.width) // 2
+    txt_y = pos_y + target_h + round(FEED_DOTS_PER_MM * 1)  # 1 mm di gap
+    if txt_y + txt_img.height <= canvas_h:
+        canvas.paste(txt_img, (txt_x, txt_y))
+
+    return canvas
+
+
+def genera_immagine_barcode_doppio(codice1: str, codice2: str) -> Image.Image:
+    """Canvas con due barcode Code128 in sequenza dall'alto verso il basso."""
+    canvas_w = min(round(LABEL_W_MM * DOTS_PER_MM), HEAD_MAX_PX)
+    target_w = min(round((LABEL_W_MM - 2 * MARGIN_MM) * DOTS_PER_MM), canvas_w)
+    canvas_h = round(LABEL_H_MM * FEED_DOTS_PER_MM)
+
+    margine_y = round(MARGIN_MM * FEED_DOTS_PER_MM)  # 80 px = 2 mm
+    # Valori divisi per 2.5 rispetto al singolo, così due codici entrano nell'etichetta
+    bar_h    = round(FEED_DOTS_PER_MM * 2.2)   # ~88 px ≈ 2.2 mm di barre
+    txt_size = round(FEED_DOTS_PER_MM * 1.5)   # ~60 px ≈ 1.5 mm (minimo leggibile)
+    txt_gap  = round(FEED_DOTS_PER_MM * 0.3)   # ~12 px
+    blk_gap  = round(FEED_DOTS_PER_MM * 1.5)   # ~60 px tra i due blocchi
+
+    canvas = Image.new("L", (canvas_w, canvas_h), 255)
+    cur_y = margine_y
+
+    for codice in [codice1, codice2]:
+        # Two-pass identico alla funzione singola
+        buf = io.BytesIO()
+        barcode.get("code128", codice, writer=ImageWriter()).write(
+            buf, options={"module_width": 1.0, "module_height": 10.0,
+                          "quiet_zone": 4, "write_text": False}
+        )
+        buf.seek(0)
+        ref_w = Image.open(buf).size[0]
+
+        buf = io.BytesIO()
+        barcode.get("code128", codice, writer=ImageWriter()).write(
+            buf, options={
+                "module_width": target_w / ref_w,
+                "module_height": 30.0,
+                "quiet_zone":    4,
+                "write_text":    False,
+            }
+        )
+        buf.seek(0)
+        src = Image.open(buf).convert("L")
+
+        if ROTATE_BARCODE:
+            src = src.rotate(-90, expand=True)
+
+        bcode_w = min(src.size[0], canvas_w)
+        src = src.resize((bcode_w, bar_h), Image.NEAREST)
+        src = src.point(lambda p: 255 if p > 128 else 0)
+
+        txt_img = _render_text(codice, bcode_w, txt_size)
+
+        pos_x = (canvas_w - bcode_w) // 2
+        canvas.paste(src, (pos_x, cur_y))
+
+        txt_x = (canvas_w - txt_img.width) // 2
+        canvas.paste(txt_img, (txt_x, cur_y + bar_h + txt_gap))
+
+        cur_y += bar_h + txt_gap + txt_img.height + blk_gap
+
     return canvas
 
 
@@ -351,6 +492,32 @@ def stampa_etichetta_articolo(codice: str) -> tuple[bool, str]:
     except Exception as e:
         traceback.print_exc()
         return False, f"Errore durante la stampa: {e}"
+
+
+def stampa_2_etichette_diverse(codice1: str, codice2: str) -> tuple[bool, str]:
+    """Stampa due codici differenti sulla stessa etichetta."""
+    try:
+        immagine = genera_immagine_barcode_doppio(codice1, codice2)
+        _debug_salva_immagine(immagine, f"doppio_{codice1}_{codice2}")
+        print(f"[stampa doppia] {codice1} / {codice2}  canvas={immagine.size}", flush=True)
+
+        if DEBUG_SAVE_IMAGE:
+            return True, "[DEBUG] Immagine generata, stampa reale saltata."
+
+        client = _connetti_stampante()
+        try:
+            _invia_immagine(client, _prepara_per_stampa(immagine), DENSITA_STAMPA)
+        finally:
+            _chiudi_stampante(client)
+        return True, f"Etichetta doppia '{codice1}' / '{codice2}' stampata."
+    except Exception as e:
+        traceback.print_exc()
+        return False, f"Errore durante la stampa: {e}"
+
+
+def stampa_2_etichette_uguali(codice: str) -> tuple[bool, str]:
+    """Stampa due volte lo stesso codice sulla stessa etichetta."""
+    return stampa_2_etichette_diverse(codice, codice)
 
 
 # ---------------------------------------------------------------------------

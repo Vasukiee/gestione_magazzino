@@ -12,7 +12,11 @@ import glob
 import signal
 import sys
 from setup_db import inizializza_database
-from stampa_etichetta_niimbot import stampa_etichetta_articolo
+# from stampa_etichetta_niimbot import (
+#     stampa_etichetta_articolo,
+#     stampa_2_etichette_uguali,
+#     stampa_2_etichette_diverse,
+# )
 
 class TerminaleMagazzino:
     def __init__(self, root):
@@ -30,6 +34,7 @@ class TerminaleMagazzino:
         self.totale_carrello_str = tk.StringVar(value="€ 0.00")
         self.totale_carrello_val = 0.0
         self.movimenti_log = {}  # id riga tree_log -> id movimento in movimenti_magazzino (per annullamento)
+        # self.primo_codice_stampa = None  # stato per stampa combinata 2 codici diversi
 
         self.setup_cartelle_backup()
 
@@ -299,9 +304,12 @@ class TerminaleMagazzino:
         self.menu_contestuale.add_command(label="Modifica / Rettifica", command=self.apri_modifica)
         self.menu_contestuale.add_command(label="Elimina Intero Record", command=self.elimina_selezionato)
         self.menu_contestuale.add_separator()
-        self.menu_contestuale.add_command(label="Stampa Etichetta Barcode", command=self.stampa_etichetta_selezionata)
+        # self.menu_contestuale.add_command(label="Stampa Etichetta Barcode", command=self.stampa_etichetta_selezionata)
+        # self.menu_contestuale.add_command(label="Stampa Doppia (stesso codice)", command=self.stampa_etichetta_doppia_identica)
+        # self.menu_contestuale.add_command(label="Stampa Combinata (2 codici diversi)", command=self.avvia_stampa_doppia_diversi)
 
         self.tree_ricerca.bind("<ButtonRelease-3>", self.mostra_menu_contestuale)
+        self.tree_ricerca.bind("<Double-1>", self.on_ricerca_double_click)
 
     def mostra_menu_contestuale(self, event):
         item = self.tree_ricerca.identify_row(event.y)
@@ -310,25 +318,72 @@ class TerminaleMagazzino:
             self.tree_ricerca.focus(item)
             self.menu_contestuale.tk_popup(event.x_root, event.y_root)
 
-    def stampa_etichetta_selezionata(self):
-        selected = self.tree_ricerca.focus()
-        if not selected:
-            return
-        valori = self.tree_ricerca.item(selected)['values']
-        codice = str(valori[0])
-        self._chiedi_stampa_etichetta(codice)
+    # def stampa_etichetta_selezionata(self):
+    #     selected = self.tree_ricerca.focus()
+    #     if not selected:
+    #         return
+    #     valori = self.tree_ricerca.item(selected)['values']
+    #     codice = str(valori[0])
+    #     self._chiedi_stampa_etichetta(codice)
+    # 
+    # def _fine_stampa_etichetta(self, successo, messaggio):
+    #     if successo:
+    #         messagebox.showinfo("Stampa completata", messaggio)
+    #     else:
+    #         messagebox.showerror("Errore di stampa", messaggio)
+    # 
+    # def _chiedi_stampa_etichetta(self, codice: str):
+    #     def esegui():
+    #         ok, msg = stampa_etichetta_articolo(codice)
+    #         self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
+    #     threading.Thread(target=esegui, daemon=True).start()
+    # 
+    # def _chiedi_stampa_generica(self, funzione_stampa, *args):
+    #     """Gestisce l'esecuzione di una funzione di stampa su un thread dedicato."""
+    #     def esegui():
+    #         ok, msg = funzione_stampa(*args)
+    #         self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
+    #     threading.Thread(target=esegui, daemon=True).start()
+    # 
+    # def stampa_etichetta_doppia_identica(self):
+    #     selected = self.tree_ricerca.focus()
+    #     if not selected: return
+    #     valori = self.tree_ricerca.item(selected)['values']
+    #     codice = str(valori[0])
+    #     self._chiedi_stampa_generica(stampa_2_etichette_uguali, codice)
+    # 
+    # def avvia_stampa_doppia_diversi(self):
+    #     selected = self.tree_ricerca.focus()
+    #     if not selected: return
+    #     valori = self.tree_ricerca.item(selected)['values']
+    #     self.primo_codice_stampa = str(valori[0])
+    #     messagebox.showinfo("Stampa Combinata",
+    #                         "Primo codice registrato. Fare doppio clic sul secondo "
+    #                         "articolo per avviare la stampa.")
+    # 
+    # def on_ricerca_double_click(self, event):
+    #     item = self.tree_ricerca.identify_row(event.y)
+    #     if not item: return
+    # 
+    #     self.tree_ricerca.selection_set(item)
+    #     self.tree_ricerca.focus(item)
+    #     valori = self.tree_ricerca.item(item)['values']
+    #     codice_selezionato = str(valori[0])
+    # 
+    #     if self.primo_codice_stampa is not None:
+    #         primo = self.primo_codice_stampa
+    #         self.primo_codice_stampa = None
+    #         self._chiedi_stampa_generica(stampa_2_etichette_diverse, primo, codice_selezionato)
+    #     else:
+    #         self.apri_modifica()
 
-    def _fine_stampa_etichetta(self, successo, messaggio):
-        if successo:
-            messagebox.showinfo("Stampa completata", messaggio)
-        else:
-            messagebox.showerror("Errore di stampa", messaggio)
+    def on_ricerca_double_click(self, event):
+        item = self.tree_ricerca.identify_row(event.y)
+        if not item: return
 
-    def _chiedi_stampa_etichetta(self, codice: str):
-        def esegui():
-            ok, msg = stampa_etichetta_articolo(codice)
-            self.root.after(0, lambda: self._fine_stampa_etichetta(ok, msg))
-        threading.Thread(target=esegui, daemon=True).start()
+        self.tree_ricerca.selection_set(item)
+        self.tree_ricerca.focus(item)
+        self.apri_modifica()
 
     def apri_modifica(self):
         selected = self.tree_ricerca.focus()
@@ -1181,14 +1236,14 @@ class TerminaleMagazzino:
                 self.var_qta.set(1)
                 item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"AGGIUNTO AL CARRELLO - {desc}")
                 popup.destroy()
-                self._chiedi_stampa_etichetta(codice)
+                # self._chiedi_stampa_etichetta(codice)
                 return
 
             self.conn.commit()
 
             self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, desc, qta, colore_val, taglia_val, id_fornitore, bolla)
             popup.destroy()
-            self._chiedi_stampa_etichetta(codice)
+            # self._chiedi_stampa_etichetta(codice)
 
         ttk.Button(popup, text="Salva", command=salva, bootstyle="success").pack(pady=10)
         popup.bind('<Return>', salva)
