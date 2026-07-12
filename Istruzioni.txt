@@ -1,26 +1,54 @@
-Se già esiste .venv
+Se gia' esiste .venv
 rm -rf .venv
 
 python -m venv .venv
 source .venv/bin/activate
-pip install ttkbootstrap
+pip install ttkbootstrap python-barcode pillow
 ./avvia_gestionale.sh
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now spegnimento-negozio.timer
 
-Stampa etichette NiimBot B1 Pro (USB seriale)
+Stampa etichette Brother QL-700 (USB / CUPS)
 
-Dipendenze Python da installare nel venv del progetto:
-pip install niimprint pyserial python-barcode pillow
+La stampa barcode usa la Brother QL-700 con rotolo continuo da 62 mm.
+Il formato configurato e' 62 x 29 mm, con area stampabile centrata da 59 mm.
+Questo formato e' dichiarato nel driver Brother come PageSize=62x29.
 
-Permessi porta seriale (eseguire una volta, poi fare logout/login):
-sudo usermod -aG uucp $USER
+Prima configurazione stampante:
 
-Soluzione permanente senza logout — regola udev che assegna automaticamente i permessi all'utente della sessione grafica:
-echo 'KERNEL=="ttyACM[0-9]*", SUBSYSTEM=="tty", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-niimbot.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger /dev/ttyACM0
+1. Collegare e accendere la Brother QL-700 via USB.
+2. Disattivare "Editor Lite" sulla stampante: tenere premuto il pulsante Editor Lite
+   finche' il LED relativo si spegne.
+3. Installare il driver Brother QL-700 per Linux (CUPS wrapper / LPR) dal sito Brother
+   oppure dal pacchetto della distribuzione.
+4. Creare una coda CUPS dedicata chiamata QL700. Verificare la URI USB con:
 
-La stampante viene riconosciuta come /dev/ttyACM0. Il rilevamento automatico della porta è abilitato (PORTA_SERIALE = "auto" in stampa_etichetta_niimbot.py): funziona se la NiimBot è l'unico dispositivo USB seriale collegato. In caso contrario, specificare la porta manualmente nel file.
+   lpinfo -v | grep QL-700
 
-Su distribuzioni non-Arch il gruppo potrebbe chiamarsi dialout invece di uucp — verificare con ls -la /dev/ttyACM0.
+   Esempio:
+
+   sudo lpadmin -p QL700 -E -v 'usb://Brother/QL-700?serial=000L4G405010' -m <MODELLO_DRIVER>
+
+5. Verificare che la coda esista:
+
+   lpstat -p QL700
+
+Non usare la coda "Stampante": e' la Brother A4 di rete, non la QL-700.
+
+Test stampa da terminale:
+
+python stampa_etichetta_brother.py TEST123
+python stampa_etichetta_brother.py test
+
+Debug senza stampare:
+
+Impostare DEBUG_SAVE_IMAGE = True in stampa_etichetta_brother.py.
+Le immagini PNG vengono salvate in /tmp/ e la stampa reale viene saltata.
+
+Calibrazione:
+
+Se l'etichetta risulta troppo corta, lunga o tagliata, modificare solo le costanti
+LABEL_H_MM, MARGIN_TOP_MM, BARCODE_H_MM e TEXT_H_MM in stampa_etichetta_brother.py.
+Non usare PageSize custom con lp: il driver Brother QL-700 accetta solo i formati
+elencati da lpoptions -p QL700 -l.
