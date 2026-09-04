@@ -1,7 +1,17 @@
-import sqlite3
 
-def inizializza_database():
-    conn = sqlite3.connect('magazzino.db')
+from db import assicura_cartelle, connetti
+
+
+def inizializza_database(conn=None):
+    """Crea lo schema e applica le migrazioni.
+
+    conn permette ai test di lavorare su un database temporaneo; se non viene
+    passata si usa quella di produzione e la si chiude a fine lavoro.
+    """
+    proprietaria = conn is None
+    if proprietaria:
+        assicura_cartelle()
+        conn = connetti()
     cursor = conn.cursor()
 
     # Anagrafica aggiornata con il doppio prezzo e soglia minima scorta
@@ -13,7 +23,8 @@ def inizializza_database():
                                                            taglia TEXT,
                                                            prezzo_acquisto REAL,
                                                            prezzo_vendita REAL,
-                                                           soglia_minima INTEGER DEFAULT 2
+                                                           soglia_minima INTEGER DEFAULT 2,
+                                                           attivo INTEGER NOT NULL DEFAULT 1
                    )
                    """)
 
@@ -78,10 +89,15 @@ def inizializza_database():
     _migra_transazioni(cursor)
     _migra_storico_passivo(cursor)
     _migra_nome_fornitore_storico(cursor)
+    _migra_articoli_attivo(cursor)
+    _ripara_fornitori_orfani(cursor)
+    _crea_viste(cursor)
 
     conn.commit()
-    conn.close()
-    print("Infrastruttura database aggiornata con storico passivo.")
+    if proprietaria:
+        conn.close()
+        print("Infrastruttura database aggiornata.")
+    return conn
 
 
 def _migra_prezzi(cursor):
@@ -140,6 +156,70 @@ def _migra_nome_fornitore_storico(cursor):
     if 'nome_fornitore_storico' not in colonne:
         cursor.execute("ALTER TABLE movimenti_magazzino ADD COLUMN nome_fornitore_storico TEXT")
         print("Migrazione: Aggiunta colonna 'nome_fornitore_storico' a movimenti_magazzino.")
+
+
+def _migra_articoli_attivo(cursor):
+    """Aggiunge la colonna attivo alla tabella articoli se non esiste.
+
+    Sostituisce la cancellazione fisica degli articoli: attivo = 0 nasconde
+    l'articolo dalle ricerche e dalle statistiche ma conserva tutti i suoi
+    movimenti, quindi lo storico e i report restano coerenti."""
+    cursor.execute("PRAGMA table_info(articoli)")
+    colonne = [col[1] for col in cursor.fetchall()]
+    if 'attivo' not in colonne:
+        cursor.execute("ALTER TABLE articoli ADD COLUMN attivo INTEGER NOT NULL DEFAULT 1")
+        print("Migrazione: Aggiunta colonna 'attivo' ad articoli.")
+
+
+def _ripara_fornitori_orfani(cursor):
+    """Azzera i riferimenti a fornitori non piu' esistenti.
+
+    Le vecchie cancellazioni di fornitori lasciavano movimenti che puntavano a
+    un id inesistente. Con PRAGMA foreign_keys attivo quelle righe restano
+    leggibili ma qualsiasi UPDATE su di esse fallirebbe, quindi il riferimento
+    va sganciato conservando il nome nello storico."""
+    orfani = cursor.execute("""
+                            SELECT m.id, m.id_fornitore FROM movimenti_magazzino m
+                            WHERE m.id_fornitore IS NOT NULL
+                              AND NOT EXISTS (SELECT 1 FROM fornitori f WHERE f.id = m.id_fornitore)
+                            """).fetchall()
+    if not orfani:
+        return
+    cursor.execute("""
+                   UPDATE movimenti_magazzino
+                   SET nome_fornitore_storico = COALESCE(nome_fornitore_storico, 'Fornitore eliminato'),
+                       id_fornitore = NULL
+                   WHERE id_fornitore IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM fornitori f WHERE f.id = id_fornitore)
+                   """)
+    print(f"Migrazione: sganciati {len(orfani)} movimenti da fornitori inesistenti.")
+
+
+def _crea_viste(cursor):
+    """(Ri)crea la vista delle giacenze.
+
+    Prima la stessa espressione COALESCE(SUM(CASE ...)) era ricopiata in sei
+    query diverse con gli id deposito scritti a mano: una sola definizione qui
+    elimina la possibilita' che divergano."""
+    cursor.execute("DROP VIEW IF EXISTS v_giacenze")
+    cursor.execute("""
+                   CREATE VIEW v_giacenze AS
+                   SELECT a.codice,
+                          COALESCE(SUM(CASE WHEN m.storico_passivo = 0 AND m.id_deposito_destinazione = 1
+                                            THEN m.quantita ELSE 0 END), 0) -
+                          COALESCE(SUM(CASE WHEN m.storico_passivo = 0 AND m.id_deposito_origine = 1
+                                            THEN m.quantita ELSE 0 END), 0) AS giac_negozio,
+                          COALESCE(SUM(CASE WHEN m.storico_passivo = 0 AND m.id_deposito_destinazione = 2
+                                            THEN m.quantita ELSE 0 END), 0) -
+                          COALESCE(SUM(CASE WHEN m.storico_passivo = 0 AND m.id_deposito_origine = 2
+                                            THEN m.quantita ELSE 0 END), 0) AS giac_box
+                   FROM articoli a
+                            LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
+                   GROUP BY a.codice
+                   """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_movimenti_codice ON movimenti_magazzino (codice)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_movimenti_transazione ON movimenti_magazzino (id_transazione)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_movimenti_data ON movimenti_magazzino (data_ora)")
 
 
 if __name__ == '__main__':
