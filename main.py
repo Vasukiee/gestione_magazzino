@@ -5,14 +5,37 @@ import sqlite3
 import datetime
 import csv
 import threading
-import time
 import os
-import shutil
 import glob
+import logging
 import signal
 import sys
+from contextlib import contextmanager
+
+import aggiornamento
+import inventario
+from db import (BACKUP_DAILY_DIR, BACKUP_DIR, BACKUP_ROLLING_DIR, DB_PATH,
+                DB_TIMEOUT, LOG_PATH, assicura_cartelle, connetti)
+from inventario import (BOX, NEGOZIO, ValoreNonValido, parse_prezzo,
+                        parse_quantita)
 from setup_db import inizializza_database
 from stampa_etichetta_brother import stampa_etichetta_articolo
+
+logger = logging.getLogger('gestionale')
+
+# Quanti backup rolling conservare e ogni quanti secondi farli.
+MAX_BACKUP_ROLLING = 16
+INTERVALLO_BACKUP = 1800
+
+
+def configura_logging():
+    """Log su file: in una GUI un print() su stderr non lo legge nessuno."""
+    logging.basicConfig(
+        filename=LOG_PATH,
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+    )
+
 
 class TerminaleMagazzino:
     def __init__(self, root):
@@ -20,7 +43,10 @@ class TerminaleMagazzino:
         self.root.title("Gestione Magazzino")
         self.root.geometry("1300x750")
 
-        self.conn = sqlite3.connect('magazzino.db', check_same_thread=False)
+        self.conn = connetti(check_same_thread=False)
+        # La connessione e' condivisa con il thread di backup: ogni scrittura e
+        # ogni backup passano da questo lock.
+        self.db_lock = threading.RLock()
         self.tipo_movimento = tk.IntVar(value=1)
         self.var_qta = tk.IntVar(value=1)
         self.var_qta_trasf = tk.IntVar(value=1)
@@ -30,43 +56,138 @@ class TerminaleMagazzino:
         self.totale_carrello_str = tk.StringVar(value="€ 0.00")
         self.totale_carrello_val = 0.0
         self.movimenti_log = {}  # id riga tree_log -> id movimento in movimenti_magazzino (per annullamento)
+        self.mostra_archiviati = tk.BooleanVar(value=False)
+        self.stato_backup = tk.StringVar(value="Backup: nessuno ancora in questa sessione.")
+        self.stato_aggiornamento = tk.StringVar(value="Aggiornamenti: controllo non ancora eseguito.")
+        self._stop_backup = threading.Event()
+        self._in_chiusura = False
 
-        self.setup_cartelle_backup()
+        assicura_cartelle()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         signal.signal(signal.SIGTERM, self.handle_sigterm)
 
         self.setup_ui()
 
-        threading.Thread(target=self.worker_backup_rolling, daemon=True).start()
+        self.backup_thread = threading.Thread(target=self.worker_backup_rolling, daemon=True)
+        self.backup_thread.start()
 
-    def setup_cartelle_backup(self):
-        os.makedirs("backup/rolling", exist_ok=True)
-        os.makedirs("backup/daily", exist_ok=True)
+        # Controllo aggiornamenti in background: la rete non deve mai ritardare
+        # l'apertura della cassa.
+        self.controlla_aggiornamenti(silenzioso=True)
+
+    # ------------------------------------------------------------------
+    # Accesso al database
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def transazione(self):
+        """Esegue un blocco di scritture come una sola transazione.
+
+        Il commit avviene solo se il blocco termina senza eccezioni; in caso
+        contrario si fa rollback. Prima gli except mostravano l'errore ma non
+        annullavano nulla, e le scritture gia' riuscite restavano pendenti sulla
+        connessione condivisa finche' un commit successivo, di tutt'altra
+        operazione, le portava a bordo.
+        """
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            try:
+                yield cursor
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+
+    def scrivi(self, azione, titolo_errore="Errore DB"):
+        """Esegue azione(cursor) in transazione, mostrando gli errori DB all'operatore.
+
+        Ritorna (ok, risultato): risultato e' il valore restituito da azione.
+        """
+        try:
+            with self.transazione() as cursor:
+                risultato = azione(cursor)
+            return True, risultato
+        except ValoreNonValido as err:
+            messagebox.showerror("Valore non valido", str(err))
+        except sqlite3.Error as err:
+            logger.exception("Errore database durante %s", getattr(azione, '__name__', azione))
+            messagebox.showerror(titolo_errore, str(err))
+        return False, None
+
+    def leggi(self, sql, parametri=()):
+        with self.db_lock:
+            return self.conn.execute(sql, parametri).fetchall()
+
+    def filtro_attivi(self, alias='a'):
+        """Clausola per escludere gli articoli archiviati, se non richiesti."""
+        return '' if self.mostra_archiviati.get() else f' AND {alias}.attivo = 1'
+
+    # ------------------------------------------------------------------
+    # Backup
+    # ------------------------------------------------------------------
+
+    def esegui_backup(self, destinazione):
+        """Copia coerente del database tramite l'API di backup online di SQLite.
+
+        shutil.copy2 su un file SQLite aperto puo' produrre una copia lacerata
+        (scrittura in corso sul thread principale) e nessuno se ne accorge
+        finche' non serve ripristinarla. sqlite3.Connection.backup() gestisce il
+        locking; os.replace rende atomica la sostituzione del file finale.
+        """
+        temporaneo = destinazione + '.tmp'
+        # Il backup parte da una connessione dedicata, non da self.conn: in WAL
+        # un secondo lettore vede uno snapshot coerente dei dati committati e
+        # non entra in conflitto con una transazione aperta sul thread della
+        # cassa (backup() sulla stessa connessione occupata riprova all'infinito).
+        sorgente = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
+        dest_conn = sqlite3.connect(temporaneo)
+        try:
+            sorgente.backup(dest_conn)
+        finally:
+            dest_conn.close()
+            sorgente.close()
+        os.replace(temporaneo, destinazione)
+        return destinazione
 
     def worker_backup_rolling(self):
-        while True:
-            time.sleep(1800)
+        # Event.wait invece di time.sleep: alla chiusura il thread esce subito
+        # invece di restare fermo fino a mezz'ora.
+        while not self._stop_backup.wait(INTERVALLO_BACKUP):
             try:
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                shutil.copy2('magazzino.db', f'backup/rolling/backup_{timestamp}.db')
+                self.esegui_backup(os.path.join(BACKUP_ROLLING_DIR, f'backup_{timestamp}.db'))
 
-                lista_file = sorted(glob.glob('backup/rolling/backup_*.db'), key=os.path.getmtime)
-                while len(lista_file) > 16:
-                    file_da_rimuovere = lista_file.pop(0)
-                    os.remove(file_da_rimuovere)
-            except Exception as e:
-                print(f"Errore backup rolling: {e}")
+                lista_file = sorted(glob.glob(os.path.join(BACKUP_ROLLING_DIR, 'backup_*.db')),
+                                    key=os.path.getmtime)
+                while len(lista_file) > MAX_BACKUP_ROLLING:
+                    os.remove(lista_file.pop(0))
+
+                ora = datetime.datetime.now().strftime('%H:%M')
+                self.stato_backup.set(f"Backup: ultimo eseguito alle {ora}.")
+                logger.info("Backup rolling eseguito alle %s", ora)
+            except (sqlite3.Error, OSError) as e:
+                self.stato_backup.set(f"Backup: ERRORE ({e}). Controllare {os.path.basename(LOG_PATH)}.")
+                logger.exception("Errore backup rolling")
 
     def on_closing(self):
+        if self._in_chiusura:
+            return
+        self._in_chiusura = True
+        self._stop_backup.set()
         try:
-            shutil.copy2('magazzino.db', 'backup/latest_backup.db')
+            self.esegui_backup(os.path.join(BACKUP_DIR, 'latest_backup.db'))
             data_odierna = datetime.datetime.now().strftime("%Y%m%d")
-            shutil.copy2('magazzino.db', f'backup/daily/backup_{data_odierna}.db')
-        except Exception as e:
+            self.esegui_backup(os.path.join(BACKUP_DAILY_DIR, f'backup_{data_odierna}.db'))
+        except (sqlite3.Error, OSError) as e:
+            logger.exception("Errore backup di chiusura")
             print(f"Errore backup chiusura: {e}")
         finally:
-            self.conn.close()
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
             self.root.destroy()
             sys.exit(0)
 
@@ -211,11 +332,10 @@ class TerminaleMagazzino:
 
     def carica_fornitori(self):
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale")
-            self.lista_fornitori = cursor.fetchall()
+            self.lista_fornitori = self.leggi("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale")
             self.combo_fornitore['values'] = [f[1] for f in self.lista_fornitori]
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
+            logger.exception("Caricamento fornitori fallito")
             self.lista_fornitori = []
 
     def setup_tab_trasferimenti(self):
@@ -265,8 +385,14 @@ class TerminaleMagazzino:
         btn_esporta_giac = ttk.Button(search_top, text="Esporta Giacenze CSV", command=self.esporta_giacenze_csv, bootstyle="success")
         btn_esporta_giac.pack(side=tk.RIGHT, padx=(0, 10))
 
-        btn_pulisci = ttk.Button(search_top, text="Elimina Giacenze Zero", command=self.pulizia_zero, bootstyle="danger")
+        btn_pulisci = ttk.Button(search_top, text="Archivia Giacenze Zero", command=self.pulizia_zero, bootstyle="danger")
         btn_pulisci.pack(side=tk.RIGHT, padx=(0, 10))
+
+        chk_archiviati = ttk.Checkbutton(search_top, text="Mostra archiviati",
+                                         variable=self.mostra_archiviati,
+                                         command=self.esegui_ricerca,
+                                         bootstyle="round-toggle")
+        chk_archiviati.pack(side=tk.RIGHT, padx=(0, 15))
 
         self.entry_ricerca.bind('<Return>', lambda e: self.esegui_ricerca())
 
@@ -293,11 +419,13 @@ class TerminaleMagazzino:
         self.tree_ricerca.column('prezzo_ven', width=90, anchor=tk.E)
         self.tree_ricerca.column('giac_neg', width=90, anchor=tk.CENTER)
         self.tree_ricerca.column('giac_box', width=90, anchor=tk.CENTER)
+        self.tree_ricerca.tag_configure('archiviato', foreground='grey')
         self.tree_ricerca.pack(fill=tk.BOTH, expand=True)
 
         self.menu_contestuale = tk.Menu(self.root, tearoff=0)
         self.menu_contestuale.add_command(label="Modifica / Rettifica", command=self.apri_modifica)
-        self.menu_contestuale.add_command(label="Elimina Intero Record", command=self.elimina_selezionato)
+        self.menu_contestuale.add_command(label="Archivia Articolo", command=self.elimina_selezionato)
+        self.menu_contestuale.add_command(label="Ripristina Articolo", command=self.ripristina_selezionato)
         self.menu_contestuale.add_separator()
         self.menu_contestuale.add_command(label="Stampa Etichetta Barcode", command=self.stampa_etichetta_selezionata)
 
@@ -342,12 +470,26 @@ class TerminaleMagazzino:
     def apri_modifica(self):
         selected = self.tree_ricerca.focus()
         if not selected: return
-        valori = self.tree_ricerca.item(selected)['values']
-        codice = valori[0]
+        codice = self.tree_ricerca.item(selected)['values'][0]
+
+        # I valori si rileggono dal database, non dalla riga del Treeview:
+        # quella e' una fotografia dell'ultima ricerca e una vendita fatta nel
+        # frattempo la rende obsoleta, facendo calcolare rettifiche sbagliate.
+        riga = self.leggi("""
+                          SELECT a.descrizione, a.colore, a.taglia, a.prezzo_acquisto,
+                                 a.prezzo_vendita, g.giac_negozio, g.giac_box, a.attivo
+                          FROM articoli a JOIN v_giacenze g ON g.codice = a.codice
+                          WHERE a.codice = ?
+                          """, (codice,))
+        if not riga:
+            messagebox.showerror("Errore", f"L'articolo {codice} non esiste piu' in anagrafica.")
+            self.esegui_ricerca()
+            return
+        desc_db, col_db, tag_db, acq_db, ven_db, giac_neg_db, giac_box_db, attivo_db = riga[0]
 
         popup = tk.Toplevel(self.root)
         popup.title(f"Modifica & Rettifica Inventario - {codice}")
-        popup.geometry("500x420")
+        popup.geometry("500x460")
         popup.grab_set()
 
         form = ttk.Frame(popup)
@@ -355,13 +497,13 @@ class TerminaleMagazzino:
 
         campi = ["Descrizione:", "Colore:", "Taglia:", "Costo Acq (€):", "Prezzo Ven (€):", "Giacenza Negozio:", "Giacenza Box:"]
         valori_attuali = [
-            valori[1],
-            valori[2],
-            valori[3],
-            str(valori[4]).replace('€ ', ''),
-            str(valori[5]).replace('€ ', ''),
-            str(valori[6]),
-            str(valori[7])
+            desc_db or '',
+            col_db or '',
+            tag_db or '',
+            f"{acq_db or 0:.2f}",
+            f"{ven_db or 0:.2f}",
+            str(giac_neg_db),
+            str(giac_box_db),
         ]
         entries = {}
 
@@ -369,123 +511,137 @@ class TerminaleMagazzino:
             ttk.Label(form, text=label, font=('Helvetica', 11, 'bold' if 'Giacenza' in label else 'normal')).grid(row=i, column=0, sticky=tk.E, pady=7)
             ent = ttk.Entry(form, width=30)
             ent.grid(row=i, column=1, pady=7)
-            val = valori_attuali[i] if str(valori_attuali[i]) != 'None' else ''
-            ent.insert(0, val)
+            ent.insert(0, valori_attuali[i])
             entries[label] = ent
+
+        if not attivo_db:
+            ttk.Label(form, text="Articolo archiviato", bootstyle="warning").grid(row=len(campi), column=1, sticky=tk.W)
 
         def salva(e=None):
             desc = entries["Descrizione:"].get().strip()
-            if not desc: return
-
-            p_acq_str = entries["Costo Acq (€):"].get().replace(',', '.')
-            p_ven_str = entries["Prezzo Ven (€):"].get().replace(',', '.')
-
-            p_acq = float(p_acq_str) if p_acq_str.replace('.','',1).isdigit() else 0.0
-            p_ven = float(p_ven_str) if p_ven_str.replace('.','',1).isdigit() else 0.0
+            if not desc:
+                messagebox.showwarning("Attenzione", "La descrizione non puo' essere vuota.")
+                return
 
             try:
-                nuova_giac_neg = int(entries["Giacenza Negozio:"].get().strip())
-                nuova_giac_box = int(entries["Giacenza Box:"].get().strip())
-            except ValueError:
-                nuova_giac_neg = int(valori[6])
-                nuova_giac_box = int(valori[7])
+                p_acq = parse_prezzo(entries["Costo Acq (€):"].get(), "Costo Acquisto")
+                p_ven = parse_prezzo(entries["Prezzo Ven (€):"].get(), "Prezzo Vendita")
+                nuova_giac_neg = parse_quantita(entries["Giacenza Negozio:"].get(), "Giacenza Negozio")
+                nuova_giac_box = parse_quantita(entries["Giacenza Box:"].get(), "Giacenza Box")
+            except ValoreNonValido as err:
+                messagebox.showerror("Valore non valido", str(err))
+                return
 
-            cursor = self.conn.cursor()
-            try:
+            def azione(cursor):
+                # Rileggo dentro la transazione: fra l'apertura del popup e il
+                # salvataggio possono essere passati minuti e altre vendite.
+                corrente = cursor.execute("""
+                                          SELECT a.descrizione, a.prezzo_vendita, g.giac_negozio, g.giac_box
+                                          FROM articoli a JOIN v_giacenze g ON g.codice = a.codice
+                                          WHERE a.codice = ?
+                                          """, (codice,)).fetchone()
+                if corrente is None:
+                    raise sqlite3.Error(f"L'articolo {codice} non esiste piu'.")
+                desc_corr, ven_corr, giac_neg_corr, giac_box_corr = corrente
+
                 variazioni = []
-                if desc != str(valori[1]): variazioni.append("Desc")
-                if p_ven != float(str(valori[5]).replace('€ ', '')): variazioni.append("Prezzo")
+                if desc != desc_corr:
+                    variazioni.append("Desc")
+                if abs(p_ven - (ven_corr or 0.0)) >= 0.005:
+                    variazioni.append("Prezzo")
 
                 cursor.execute("""
                                UPDATE articoli SET descrizione = ?, colore = ?, taglia = ?, prezzo_acquisto = ?, prezzo_vendita = ?
                                WHERE codice = ?
-                               """, (desc, entries["Colore:"].get(), entries["Taglia:"].get(), p_acq, p_ven, codice))
+                               """, (desc, entries["Colore:"].get().strip(), entries["Taglia:"].get().strip(),
+                                     p_acq, p_ven, codice))
 
-                # Inserimenti anomalie stock (Tipi 6 e 7)
-                delta_neg = nuova_giac_neg - int(valori[6])
-                if delta_neg > 0:
-                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, 1, 6)", (codice, delta_neg))
-                elif delta_neg < 0:
-                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, tipo) VALUES (?, ?, 1, 7)", (codice, abs(delta_neg)))
+                inventario.registra_rettifica(cursor, codice, NEGOZIO,
+                                              nuova_giac_neg - giac_neg_corr,
+                                              "Rettifica manuale da scheda articolo")
+                inventario.registra_rettifica(cursor, codice, BOX,
+                                              nuova_giac_box - giac_box_corr,
+                                              "Rettifica manuale da scheda articolo")
 
-                delta_box = nuova_giac_box - int(valori[7])
-                if delta_box > 0:
-                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, 2, 6)", (codice, delta_box))
-                elif delta_box < 0:
-                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, tipo) VALUES (?, ?, 2, 7)", (codice, abs(delta_box)))
-
-                # Inserimento anomalia anagrafica (Tipo 8)
                 if variazioni:
                     nota = "Modificato manualmente: " + ", ".join(variazioni)
-                    try:
-                        cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, tipo, riferimento_bolla) VALUES (?, 0, 8, ?)", (codice, nota))
-                    except sqlite3.OperationalError:
-                        cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, tipo) VALUES (?, 0, 8)", (codice,))
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, tipo, riferimento_bolla) VALUES (?, 0, ?, ?)",
+                                   (codice, inventario.MODIFICA_ANAGRAFICA, nota))
 
-                self.conn.commit()
+            ok, _ = self.scrivi(azione)
+            if ok:
                 popup.destroy()
                 self.esegui_ricerca()
-            except sqlite3.Error as err:
-                messagebox.showerror("Errore DB", str(err))
 
         ttk.Button(popup, text="Salva Modifiche", command=salva, bootstyle="success").pack(pady=10)
+        popup.bind('<Return>', salva)
 
     def elimina_selezionato(self):
+        """Archivia l'articolo (soft delete) conservandone lo storico.
+
+        La cancellazione fisica eliminava anche tutti i movimenti: lo storico
+        vendite spariva, i report cambiavano a posteriori e le righe di
+        transazioni_ restavano orfane. Con attivo = 0 l'articolo sparisce da
+        ricerche e statistiche ma i movimenti restano.
+        """
         selected = self.tree_ricerca.focus()
         if not selected: return
         codice = self.tree_ricerca.item(selected)['values'][0]
 
-        if messagebox.askyesno("Eliminazione", f"Sei sicuro di voler eliminare l'articolo {codice} e tutti i suoi movimenti?"):
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute("DELETE FROM movimenti_magazzino WHERE codice = ?", (codice,))
-                cursor.execute("DELETE FROM articoli WHERE codice = ?", (codice,))
-                self.conn.commit()
-                self.esegui_ricerca()
-            except sqlite3.Error as e:
-                messagebox.showerror("Errore DB", str(e))
-
-    def pulizia_zero(self):
-        if not messagebox.askyesno("Avviso Critico", "Questa operazione eliminerà permanentemente tutti gli articoli (e i relativi movimenti) la cui giacenza totale tra i depositi è uguale a 0.\n\nProcedere?"):
+        if not messagebox.askyesno(
+                "Archivia Articolo",
+                f"Archiviare l'articolo {codice}?\n\n"
+                "Sparira' da ricerche, giacenze e statistiche, ma i suoi movimenti "
+                "restano nello storico e nei report.\n"
+                "Puoi rivederlo spuntando 'Mostra archiviati' e ripristinarlo dal menu destro."):
             return
 
-        sql_delete_articoli = """
-                              DELETE FROM articoli WHERE codice IN (
-                                  SELECT a.codice FROM articoli a
-                                                           LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-                                  GROUP BY a.codice
-                                  HAVING (
-                                             COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                                             COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) +
-                                             COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                                             COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0)
-                                             ) = 0
-                              ) \
-                              """
-
-        sql_delete_movimenti = """
-                               DELETE FROM movimenti_magazzino WHERE codice IN (
-                                   SELECT a.codice FROM articoli a
-                                                            LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-                                   GROUP BY a.codice
-                                   HAVING (
-                                              COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                                              COALESCE(SUM(CASE WHEN id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) +
-                                              COALESCE(SUM(CASE WHEN id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                                              COALESCE(SUM(CASE WHEN id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0)
-                                              ) = 0
-                               ) \
-                               """
-
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(sql_delete_movimenti)
-            cursor.execute(sql_delete_articoli)
-            self.conn.commit()
-            messagebox.showinfo("Completato", "Inventario pulito correttamente.")
+        ok, _ = self.scrivi(lambda cur: cur.execute(
+            "UPDATE articoli SET attivo = 0 WHERE codice = ?", (codice,)))
+        if ok:
             self.esegui_ricerca()
-        except sqlite3.Error as e:
-            messagebox.showerror("Errore DB", str(e))
+
+    def ripristina_selezionato(self):
+        selected = self.tree_ricerca.focus()
+        if not selected: return
+        codice = self.tree_ricerca.item(selected)['values'][0]
+        ok, _ = self.scrivi(lambda cur: cur.execute(
+            "UPDATE articoli SET attivo = 1 WHERE codice = ?", (codice,)))
+        if ok:
+            self.esegui_ricerca()
+
+    def pulizia_zero(self):
+        """Archivia in blocco gli articoli con giacenza totale zero."""
+        candidati = self.leggi("""
+                               SELECT a.codice FROM articoli a
+                                                        JOIN v_giacenze g ON g.codice = a.codice
+                               WHERE a.attivo = 1 AND (g.giac_negozio + g.giac_box) = 0
+                               """)
+        if not candidati:
+            messagebox.showinfo("Info", "Nessun articolo con giacenza zero da archiviare.")
+            return
+
+        if not messagebox.askyesno(
+                "Archivia giacenze zero",
+                f"Verranno archiviati {len(candidati)} articoli con giacenza totale pari a 0.\n\n"
+                "I movimenti e lo storico vendite NON vengono cancellati: gli articoli "
+                "spariscono solo da ricerche e statistiche.\n\nProcedere?"):
+            return
+
+        def azione(cursor):
+            cursor.execute("""
+                           UPDATE articoli SET attivo = 0
+                           WHERE attivo = 1 AND codice IN (
+                               SELECT g.codice FROM v_giacenze g
+                               WHERE (g.giac_negozio + g.giac_box) = 0
+                           )
+                           """)
+            return cursor.rowcount
+
+        ok, quanti = self.scrivi(azione)
+        if ok:
+            messagebox.showinfo("Completato", f"Archiviati {quanti} articoli.")
+            self.esegui_ricerca()
 
     def setup_tab_statistiche(self):
         self.frame_stat = ttk.Frame(self.tab_statistiche)
@@ -507,6 +663,153 @@ class TerminaleMagazzino:
 
         btn_report_anomalie = ttk.Button(self.frame_stat, text="Esporta Report Anomalie CSV", command=self.esporta_report_anomalie_csv, bootstyle="danger")
         btn_report_anomalie.grid(row=5, column=0, sticky=tk.W, pady=(20, 0))
+
+        ttk.Separator(self.frame_stat, orient=tk.HORIZONTAL).grid(row=6, column=0, sticky="ew", pady=20)
+
+        # Stato di backup e aggiornamenti: in una GUI un print() su stderr non
+        # lo legge nessuno, e un backup che fallisce da giorni deve vedersi.
+        ttk.Label(self.frame_stat, textvariable=self.stato_backup, font=('Helvetica', 11)).grid(row=7, column=0, sticky=tk.W, pady=4)
+        ttk.Label(self.frame_stat, textvariable=self.stato_aggiornamento, font=('Helvetica', 11)).grid(row=8, column=0, sticky=tk.W, pady=4)
+
+        btn_frame_manutenzione = ttk.Frame(self.frame_stat)
+        btn_frame_manutenzione.grid(row=9, column=0, sticky=tk.W, pady=(15, 0))
+
+        ttk.Button(btn_frame_manutenzione, text="Backup adesso",
+                   command=self.backup_manuale, bootstyle="secondary").pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_aggiornamenti = ttk.Button(btn_frame_manutenzione, text="Controlla aggiornamenti",
+                                            command=lambda: self.controlla_aggiornamenti(silenzioso=False),
+                                            bootstyle="info")
+        self.btn_aggiornamenti.pack(side=tk.LEFT)
+
+    def backup_manuale(self):
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            percorso = self.esegui_backup(os.path.join(BACKUP_ROLLING_DIR, f'backup_{timestamp}.db'))
+            self.stato_backup.set(f"Backup: ultimo eseguito alle {datetime.datetime.now().strftime('%H:%M')}.")
+            messagebox.showinfo("Backup", f"Backup completato:\n{percorso}")
+        except (sqlite3.Error, OSError) as e:
+            logger.exception("Backup manuale fallito")
+            messagebox.showerror("Backup", f"Backup fallito: {e}")
+
+    # ------------------------------------------------------------------
+    # Aggiornamenti da GitHub
+    # ------------------------------------------------------------------
+
+    def controlla_aggiornamenti(self, silenzioso=True):
+        """Avvia il controllo in un thread: la rete non deve bloccare la cassa."""
+        self.stato_aggiornamento.set("Aggiornamenti: controllo in corso...")
+
+        def lavoro():
+            esito = aggiornamento.controlla()
+            self.root.after(0, lambda: self._mostra_esito_aggiornamento(esito, silenzioso))
+
+        threading.Thread(target=lavoro, daemon=True).start()
+
+    def _mostra_esito_aggiornamento(self, esito, silenzioso):
+        etichette = {
+            aggiornamento.AGGIORNATO: "Aggiornamenti: nessuno, sei all'ultima versione.",
+            aggiornamento.DISPONIBILE: f"Aggiornamenti: {len(esito.commits)} disponibili.",
+            aggiornamento.AVANTI: "Aggiornamenti: hai commit locali non pubblicati.",
+            aggiornamento.DIVERGENTE: "Aggiornamenti: versione divergente, serve intervento manuale.",
+            aggiornamento.NON_DISPONIBILE: "Aggiornamenti: non disponibili (git assente).",
+            aggiornamento.ERRORE: "Aggiornamenti: controllo fallito (rete?).",
+        }
+        self.stato_aggiornamento.set(etichette.get(esito.stato, "Aggiornamenti: stato sconosciuto."))
+        logger.info("Controllo aggiornamenti: %s - %s", esito.stato, esito.messaggio)
+
+        if esito.stato == aggiornamento.DISPONIBILE:
+            self._popup_aggiornamento(esito)
+            return
+
+        # All'avvio si parla solo se c'e' qualcosa da fare: nessun popup da
+        # chiudere ogni mattina prima di aprire la cassa.
+        if not silenzioso:
+            messagebox.showinfo("Aggiornamenti", esito.messaggio or "Nessun aggiornamento disponibile.")
+
+    def _popup_aggiornamento(self, esito):
+        popup = tk.Toplevel(self.root)
+        popup.title("Aggiornamento disponibile")
+        popup.geometry("640x460")
+        popup.grab_set()
+
+        ttk.Label(popup, text=f"Sono disponibili {len(esito.commits)} aggiornamenti",
+                  font=('Helvetica', 15, 'bold')).pack(pady=(15, 5))
+        ttk.Label(popup, text=f"Versione installata: {esito.commit_locale[:8]}  →  nuova: {esito.commit_remoto[:8]}",
+                  font=('Helvetica', 10)).pack(pady=(0, 10))
+
+        cornice = ttk.Frame(popup)
+        cornice.pack(fill=tk.BOTH, expand=True, padx=15)
+        testo = tk.Text(cornice, wrap=tk.WORD, height=12, font=('TkFixedFont', 9))
+        scroll = ttk.Scrollbar(cornice, orient=tk.VERTICAL, command=testo.yview)
+        testo.configure(yscrollcommand=scroll.set)
+        testo.insert('1.0', '\n'.join(esito.commits) or 'Nessun dettaglio disponibile.')
+        testo.configure(state=tk.DISABLED)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        testo.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        if esito.modifiche_locali:
+            elenco = ', '.join(esito.modifiche_locali[:5])
+            ttk.Label(popup,
+                      text=("Modifiche locali non committate: l'aggiornamento le sovrascriverebbe.\n"
+                            f"{elenco}\nCommittale o annullale prima di aggiornare."),
+                      bootstyle="danger", justify=tk.LEFT).pack(pady=10, padx=15, anchor=tk.W)
+
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(pady=15)
+
+        ttk.Button(btn_frame, text="Più tardi", command=popup.destroy,
+                   bootstyle="secondary").pack(side=tk.LEFT, padx=10)
+        btn_aggiorna = ttk.Button(btn_frame, text="Aggiorna e riavvia",
+                                  command=lambda: self._applica_aggiornamento(popup, btn_aggiorna),
+                                  bootstyle="success")
+        btn_aggiorna.pack(side=tk.LEFT, padx=10)
+        if esito.modifiche_locali:
+            btn_aggiorna.configure(state=tk.DISABLED)
+
+    def _applica_aggiornamento(self, popup, bottone):
+        bottone.configure(state=tk.DISABLED, text="Aggiornamento in corso...")
+
+        # Backup prima di toccare i file: se il nuovo codice ha una migrazione
+        # sbagliata, il database di ieri sera e' ancora recuperabile.
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            self.esegui_backup(os.path.join(BACKUP_DAILY_DIR, f'pre_aggiornamento_{timestamp}.db'))
+        except (sqlite3.Error, OSError) as e:
+            logger.exception("Backup pre-aggiornamento fallito")
+            messagebox.showerror("Aggiornamento",
+                                 f"Backup preventivo fallito, aggiornamento annullato:\n{e}")
+            bottone.configure(state=tk.NORMAL, text="Aggiorna e riavvia")
+            return
+
+        ok, messaggio, precedente = aggiornamento.applica()
+        logger.info("Aggiornamento applicato=%s: %s", ok, messaggio)
+
+        if not ok:
+            messagebox.showerror("Aggiornamento", messaggio)
+            bottone.configure(state=tk.NORMAL, text="Aggiorna e riavvia")
+            return
+
+        popup.destroy()
+        messagebox.showinfo(
+            "Aggiornamento completato",
+            f"{messaggio}\n\nIl gestionale verrà riavviato.\n\n"
+            f"Per tornare indietro: git reset --hard {precedente[:8]}")
+        self.riavvia()
+
+    def riavvia(self):
+        """Chiude ordinatamente e rilancia il processo con lo stesso interprete."""
+        self._stop_backup.set()
+        try:
+            self.esegui_backup(os.path.join(BACKUP_DIR, 'latest_backup.db'))
+        except (sqlite3.Error, OSError):
+            logger.exception("Backup pre-riavvio fallito")
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+        self._in_chiusura = True
+        self.root.destroy()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def setup_tab_fornitori(self):
         paned = ttk.Panedwindow(self.tab_fornitori, orient=tk.HORIZONTAL)
@@ -550,9 +853,7 @@ class TerminaleMagazzino:
     def aggiorna_lista_fornitori(self):
         for item in self.tree_fornitori.get_children():
             self.tree_fornitori.delete(item)
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale")
-        for id_forn, nome in cursor.fetchall():
+        for id_forn, nome in self.leggi("SELECT id, ragione_sociale FROM fornitori ORDER BY ragione_sociale"):
             self.tree_fornitori.insert('', tk.END, iid=str(id_forn), values=(nome,))
         # Aggiorna anche il combobox usato nel Carico
         self.carica_fornitori()
@@ -580,18 +881,17 @@ class TerminaleMagazzino:
             messagebox.showwarning("Attenzione", "Inserire la ragione sociale del fornitore.")
             return
 
-        cursor = self.conn.cursor()
-        try:
-            if self.fornitore_in_modifica is not None:
-                cursor.execute("UPDATE fornitori SET ragione_sociale = ? WHERE id = ?", (nome, self.fornitore_in_modifica))
-            else:
-                cursor.execute("INSERT INTO fornitori (ragione_sociale) VALUES (?)", (nome,))
-            self.conn.commit()
-        except sqlite3.IntegrityError:
-            messagebox.showerror("Errore", f"Esiste già un fornitore con ragione sociale '{nome}'.")
-            return
-        except sqlite3.Error as e:
-            messagebox.showerror("Errore DB", str(e))
+        def azione(cursor):
+            try:
+                if self.fornitore_in_modifica is not None:
+                    cursor.execute("UPDATE fornitori SET ragione_sociale = ? WHERE id = ?", (nome, self.fornitore_in_modifica))
+                else:
+                    cursor.execute("INSERT INTO fornitori (ragione_sociale) VALUES (?)", (nome,))
+            except sqlite3.IntegrityError:
+                raise sqlite3.Error(f"Esiste già un fornitore con ragione sociale '{nome}'.")
+
+        ok, _ = self.scrivi(azione)
+        if not ok:
             return
 
         self.reset_form_fornitore()
@@ -605,9 +905,8 @@ class TerminaleMagazzino:
         id_forn = int(selezione[0])
         nome = self.tree_fornitori.item(selezione[0], 'values')[0]
 
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM movimenti_magazzino WHERE id_fornitore = ?", (id_forn,))
-        n_movimenti = cursor.fetchone()[0]
+        righe = self.leggi("SELECT COUNT(*) FROM movimenti_magazzino WHERE id_fornitore = ?", (id_forn,))
+        n_movimenti = righe[0][0] if righe else 0
 
         messaggio = f"Eliminare il fornitore '{nome}'?"
         if n_movimenti > 0:
@@ -617,14 +916,15 @@ class TerminaleMagazzino:
         if not messagebox.askyesno("Elimina Fornitore", messaggio):
             return
 
-        try:
-            # Preserva il nome nello storico prima di eliminare il fornitore dall'anagrafica
-            cursor.execute("UPDATE movimenti_magazzino SET nome_fornitore_storico = ? WHERE id_fornitore = ?", (nome, id_forn))
+        def azione(cursor):
+            # Preserva il nome nello storico e libera la foreign key: con
+            # PRAGMA foreign_keys attivo la DELETE fallirebbe finché i
+            # movimenti puntano ancora al fornitore.
+            cursor.execute("UPDATE movimenti_magazzino SET nome_fornitore_storico = ?, id_fornitore = NULL WHERE id_fornitore = ?", (nome, id_forn))
             cursor.execute("DELETE FROM fornitori WHERE id = ?", (id_forn,))
-            self.conn.commit()
-        except sqlite3.Error as e:
-            self.conn.rollback()
-            messagebox.showerror("Errore DB", str(e))
+
+        ok, _ = self.scrivi(azione)
+        if not ok:
             return
 
         self.reset_form_fornitore()
@@ -670,8 +970,9 @@ class TerminaleMagazzino:
 
         try:
             qta = self.var_qta_trasf.get()
-            if qta <= 0: raise ValueError
-        except:
+            if qta <= 0:
+                qta = 1
+        except (tk.TclError, ValueError):
             qta = 1
 
         orig_str = self.combo_orig.get()
@@ -681,54 +982,46 @@ class TerminaleMagazzino:
             messagebox.showerror("Errore", "Magazzino di origine e destinazione coincidono.")
             return
 
-        orig_id = 1 if orig_str == "Negozio" else 2
-        dest_id = 1 if dest_str == "Negozio" else 2
+        orig_id = NEGOZIO if orig_str == "Negozio" else BOX
+        dest_id = NEGOZIO if dest_str == "Negozio" else BOX
 
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT descrizione, colore, taglia FROM articoli WHERE codice = ?", (codice,))
-        articolo = cursor.fetchone()
-        if not articolo:
+        righe = self.leggi("SELECT descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita FROM articoli WHERE codice = ?", (codice,))
+        if not righe:
             messagebox.showerror("Errore", "Articolo inesistente in anagrafica. Effettuare prima il carico.")
             return
+        articolo = righe[0]
 
-        cursor.execute("""
-                       SELECT
-                           COALESCE(SUM(CASE WHEN id_deposito_destinazione = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0) -
-                           COALESCE(SUM(CASE WHEN id_deposito_origine = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0)
-                       FROM movimenti_magazzino WHERE codice = ?
-                       """, (orig_id, orig_id, codice))
+        with self.db_lock:
+            giac_attuale = inventario.giacenza(self.conn, codice, orig_id)
 
-        giac_attuale = cursor.fetchone()[0]
+        ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
+        nome_op = f"Trasferimento a {dest_str}"
 
         if giac_attuale < qta:
-            ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
-            self.mostra_popup_sottoscorta(codice, orig_id, dest_id, 5, f"Trasferimento a {dest_str}", ora_attuale, qta, giac_attuale, articolo)
+            self.mostra_popup_sottoscorta(codice, orig_id, dest_id, inventario.TRASFERIMENTO,
+                                          nome_op, ora_attuale, qta, giac_attuale, articolo)
             return
 
-        self.esegui_query_movimento(codice, orig_id, dest_id, 5, f"Trasferimento a {dest_str}", datetime.datetime.now().strftime("%H:%M:%S"), articolo[0], qta, articolo[1], articolo[2], None, None)
+        self.esegui_query_movimento(codice, orig_id, dest_id, inventario.TRASFERIMENTO, nome_op,
+                                    ora_attuale, articolo[0], qta, articolo[1], articolo[2], None, None)
 
     def aggiorna_statistiche(self):
-        sql = """
-              SELECT
-                  SUM(giac_negozio), SUM(giac_negozio * prezzo_acquisto), SUM(giac_negozio * prezzo_vendita),
-                  SUM(giac_box), SUM(giac_box * prezzo_acquisto), SUM(giac_box * prezzo_vendita)
-              FROM (
-                       SELECT a.prezzo_acquisto, a.prezzo_vendita,
-                              COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                              COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giac_negozio,
-                              COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                              COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giac_box
-                       FROM articoli a
-                                LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-                       GROUP BY a.codice
-                   ) \
+        sql = f"""
+              SELECT SUM(g.giac_negozio), SUM(g.giac_negozio * COALESCE(a.prezzo_acquisto, 0)),
+                     SUM(g.giac_negozio * COALESCE(a.prezzo_vendita, 0)),
+                     SUM(g.giac_box), SUM(g.giac_box * COALESCE(a.prezzo_acquisto, 0)),
+                     SUM(g.giac_box * COALESCE(a.prezzo_vendita, 0))
+              FROM articoli a JOIN v_giacenze g ON g.codice = a.codice
+              WHERE 1 = 1 {self.filtro_attivi('a')}
               """
-        cursor = self.conn.cursor()
-        cursor.execute(sql)
-        row = cursor.fetchone()
+        righe = self.leggi(sql)
+        row = righe[0] if righe else None
 
         if not row or row[0] is None:
             self.lbl_tot_pz.config(text="Nessun dato disponibile.")
+            self.lbl_val_acq.config(text="")
+            self.lbl_val_ven.config(text="")
+            self.lbl_dettaglio.config(text="")
             return
 
         pz_neg, acq_neg, ven_neg, pz_box, acq_box, ven_box = row
@@ -754,107 +1047,97 @@ class TerminaleMagazzino:
         self.lbl_dettaglio.config(text=dettaglio)
 
     def esegui_ricerca(self):
-        query_text = f"%{self.entry_ricerca.get().strip()}%"
-        sql = """
+        termine = self.entry_ricerca.get().strip()
+        # % e _ sono metacaratteri LIKE: senza escape una ricerca di "50%"
+        # restituirebbe mezzo catalogo.
+        termine = termine.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        query_text = f"%{termine}%"
+        sql = f"""
               SELECT a.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giacenza_negozio,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giacenza_box
+                     g.giac_negozio, g.giac_box, a.attivo
               FROM articoli a
-                       LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-              WHERE a.codice LIKE ? OR a.descrizione LIKE ? OR a.colore LIKE ?
-              GROUP BY a.codice \
+                       JOIN v_giacenze g ON g.codice = a.codice
+              WHERE (a.codice LIKE ? ESCAPE '\\' OR a.descrizione LIKE ? ESCAPE '\\' OR a.colore LIKE ? ESCAPE '\\')
+                    {self.filtro_attivi('a')}
+              ORDER BY a.descrizione
               """
-        cursor = self.conn.cursor()
-        cursor.execute(sql, (query_text, query_text, query_text))
-        for item in self.tree_ricerca.get_children(): self.tree_ricerca.delete(item)
-        for r in cursor.fetchall():
-            self.tree_ricerca.insert('', tk.END, values=(r[0], r[1], r[2], r[3], f"€ {r[4]:.2f}", f"€ {r[5]:.2f}", r[6], r[7]))
+        righe = self.leggi(sql, (query_text, query_text, query_text))
+        self.popola_tree_ricerca(righe)
+
+    def popola_tree_ricerca(self, righe, tag_extra=None):
+        for item in self.tree_ricerca.get_children():
+            self.tree_ricerca.delete(item)
+        for r in righe:
+            tags = []
+            if tag_extra:
+                tags.append(tag_extra)
+            if len(r) > 8 and not r[8]:
+                tags.append('archiviato')
+            self.tree_ricerca.insert('', tk.END,
+                                     values=(r[0], r[1], r[2], r[3],
+                                             f"€ {r[4] or 0:.2f}", f"€ {r[5] or 0:.2f}", r[6], r[7]),
+                                     tags=tuple(tags))
 
     def mostra_esaurimento(self):
-        sql = """
+        sql = f"""
               SELECT a.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giacenza_negozio,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giacenza_box
+                     g.giac_negozio, g.giac_box, a.attivo
               FROM articoli a
-                       LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-              GROUP BY a.codice, a.soglia_minima
-              HAVING (giacenza_negozio + giacenza_box) <= a.soglia_minima \
+                       JOIN v_giacenze g ON g.codice = a.codice
+              WHERE (g.giac_negozio + g.giac_box) <= COALESCE(a.soglia_minima, 0)
+                    {self.filtro_attivi('a')}
+              ORDER BY a.descrizione
               """
-        cursor = self.conn.cursor()
-        cursor.execute(sql)
-        for item in self.tree_ricerca.get_children(): self.tree_ricerca.delete(item)
-        for r in cursor.fetchall():
-            self.tree_ricerca.insert('', tk.END, values=(r[0], r[1], r[2], r[3], f"€ {r[4]:.2f}", f"€ {r[5]:.2f}", r[6], r[7]), tags=('danger',))
+        self.popola_tree_ricerca(self.leggi(sql), tag_extra='danger')
 
     def esporta_storico_csv(self):
+        # I fallback su OperationalError sono stati rimossi: lo schema e'
+        # garantito dalle migrazioni in setup_db. Prima un banale
+        # 'database is locked' veniva scambiato per uno schema vecchio e la
+        # riesecuzione buttava via fornitore e numero bolla.
         sql = """
               SELECT m.data_ora,
                      CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' ELSE 'Altro' END,
                      m.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
                      COALESCE(d_orig.nome_deposito, '-'), COALESCE(d_dest.nome_deposito, '-'), m.quantita,
-                     COALESCE(f.ragione_sociale, m.nome_fornitore_storico, ''), COALESCE(m.riferimento_bolla, '')
+                     COALESCE(f.ragione_sociale, m.nome_fornitore_storico, ''), COALESCE(m.riferimento_bolla, ''),
+                     CASE WHEN m.storico_passivo = 1 THEN 'Si' ELSE 'No' END
               FROM movimenti_magazzino m
                        LEFT JOIN articoli a ON m.codice = a.codice
                        LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
                        LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
                        LEFT JOIN fornitori f ON m.id_fornitore = f.id
-              ORDER BY m.data_ora DESC \
+              ORDER BY m.data_ora DESC
               """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(sql)
-        except sqlite3.OperationalError:
-            sql_fallback = """
-                           SELECT m.data_ora,
-                                  CASE m.tipo WHEN 1 THEN 'Carico' WHEN 2 THEN 'Scarico' WHEN 3 THEN 'Reso Cliente' WHEN 4 THEN 'Reso Fornitore' WHEN 5 THEN 'Trasferimento Interno' WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' ELSE 'Altro' END,
-                                  m.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
-                                  COALESCE(d_orig.nome_deposito, '-'), COALESCE(d_dest.nome_deposito, '-'), m.quantita,
-                                  '', ''
-                           FROM movimenti_magazzino m
-                                    LEFT JOIN articoli a ON m.codice = a.codice
-                                    LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
-                                    LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
-                           ORDER BY m.data_ora DESC \
-                           """
-            cursor.execute(sql_fallback)
-
-        righe = cursor.fetchall()
+        righe = self.leggi(sql)
         if not righe: return messagebox.showinfo("Info", "Nessun movimento.")
         path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"storico_{datetime.datetime.now().strftime('%Y%m%d')}.csv")
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Costo", "Prezzo", "Origine", "Destinazione", "Quantità", "Fornitore", "Note / Bolla"])
+                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Costo", "Prezzo", "Origine", "Destinazione", "Quantità", "Fornitore", "Note / Bolla", "Annullato"])
                 writer.writerows(righe)
+            messagebox.showinfo("Esportazione", f"Storico esportato: {len(righe)} righe.")
 
     def esporta_giacenze_csv(self):
-        sql = """
+        sql = f"""
               SELECT a.codice, a.descrizione, a.colore, a.taglia, a.prezzo_acquisto, a.prezzo_vendita,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 1 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giac_neg,
-                     COALESCE(SUM(CASE WHEN m.id_deposito_destinazione = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) -
-                     COALESCE(SUM(CASE WHEN m.id_deposito_origine = 2 THEN (CASE WHEN m.storico_passivo = 0 THEN m.quantita ELSE 0 END) ELSE 0 END), 0) AS giac_box
-              FROM articoli a
-                       LEFT JOIN movimenti_magazzino m ON a.codice = m.codice
-              GROUP BY a.codice
-              ORDER BY a.descrizione \
+                     g.giac_negozio, g.giac_box,
+                     CASE WHEN a.attivo = 1 THEN 'No' ELSE 'Si' END
+              FROM articoli a JOIN v_giacenze g ON g.codice = a.codice
+              WHERE 1 = 1 {self.filtro_attivi('a')}
+              ORDER BY a.descrizione
               """
-        cursor = self.conn.cursor()
-        cursor.execute(sql)
-        righe = cursor.fetchall()
+        righe = self.leggi(sql)
         if not righe: return messagebox.showinfo("Info", "Nessun articolo in anagrafica.")
         path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"inventario_giacenze_{datetime.datetime.now().strftime('%Y%m%d')}.csv")
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(["Codice", "Descrizione", "Colore", "Taglia", "Costo Acquisto", "Prezzo Vendita", "Giacenza Negozio", "Giacenza Box", "Giacenza Totale"])
+                writer.writerow(["Codice", "Descrizione", "Colore", "Taglia", "Costo Acquisto", "Prezzo Vendita", "Giacenza Negozio", "Giacenza Box", "Giacenza Totale", "Archiviato"])
                 for r in righe:
-                    totale = r[6] + r[7]
-                    writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], totale])
+                    writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[6] + r[7], r[8]])
+            messagebox.showinfo("Esportazione", f"Giacenze esportate: {len(righe)} righe.")
 
     def esporta_report_anomalie_csv(self):
         sql = """
@@ -864,36 +1147,16 @@ class TerminaleMagazzino:
                      COALESCE(d_orig.nome_deposito, '-') AS origine,
                      COALESCE(d_dest.nome_deposito, '-') AS destinazione,
                      m.quantita,
-                     COALESCE(m.riferimento_bolla, '') AS note
+                     COALESCE(m.riferimento_bolla, '') AS note,
+                     CASE WHEN m.storico_passivo = 1 THEN 'Si' ELSE 'No' END AS annullato
               FROM movimenti_magazzino m
                        LEFT JOIN articoli a ON m.codice = a.codice
                        LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
                        LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
               WHERE m.tipo IN (6, 7, 8)
-              ORDER BY m.data_ora DESC \
+              ORDER BY m.data_ora DESC
               """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(sql)
-        except sqlite3.OperationalError:
-            sql_fallback = """
-                           SELECT m.data_ora,
-                                  CASE m.tipo WHEN 6 THEN 'Rettifica Positiva' WHEN 7 THEN 'Rettifica Negativa' WHEN 8 THEN 'Modifica Anagrafica' END AS operazione,
-                                  m.codice, a.descrizione, a.colore, a.taglia,
-                                  COALESCE(d_orig.nome_deposito, '-') AS origine,
-                                  COALESCE(d_dest.nome_deposito, '-') AS destinazione,
-                                  m.quantita,
-                                  '' AS note
-                           FROM movimenti_magazzino m
-                                    LEFT JOIN articoli a ON m.codice = a.codice
-                                    LEFT JOIN depositi d_orig ON m.id_deposito_origine = d_orig.id
-                                    LEFT JOIN depositi d_dest ON m.id_deposito_destinazione = d_dest.id
-                           WHERE m.tipo IN (6, 7, 8)
-                           ORDER BY m.data_ora DESC \
-                           """
-            cursor.execute(sql_fallback)
-
-        righe = cursor.fetchall()
+        righe = self.leggi(sql)
         if not righe:
             return messagebox.showinfo("Info", "Nessuna rettifica o modifica registrata.")
         path = filedialog.asksaveasfilename(
@@ -903,7 +1166,7 @@ class TerminaleMagazzino:
         if path:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f, delimiter=';')
-                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Deposito Origine", "Deposito Destinazione", "Quantità", "Note Aggiuntive"])
+                writer.writerow(["Data Ora", "Operazione", "Codice", "Descrizione", "Colore", "Taglia", "Deposito Origine", "Deposito Destinazione", "Quantità", "Note Aggiuntive", "Annullato"])
                 writer.writerows(righe)
             messagebox.showinfo("Esportazione", f"Report anomalie esportato con {len(righe)} righe.")
 
@@ -940,6 +1203,9 @@ class TerminaleMagazzino:
                 valori = list(self.tree_log.item(id_riga_log, 'values'))
                 valori[4] = ''.join(c + '\u0336' for c in valori[4])
                 self.tree_log.item(id_riga_log, values=valori, tags=('rimosso',))
+            # Nessuna scrittura sul database: le eventuali rettifiche di una
+            # vendita forzata non sono ancora state registrate, quindi togliere
+            # la riga dal carrello non lascia stock fantasma.
             del self.carrello[indice]
             self.aggiorna_ui_carrello()
 
@@ -956,25 +1222,40 @@ class TerminaleMagazzino:
             return
 
         # Le righe già barrate (rimosse o annullate) non sono annullabili di nuovo
-        if 'tags' in self.tree_log.item(id_riga) and ('rimosso' in self.tree_log.item(id_riga, 'tags') or 'annullato' in self.tree_log.item(id_riga, 'tags')):
+        tags_riga = self.tree_log.item(id_riga, 'tags') or ()
+        if 'rimosso' in tags_riga or 'annullato' in tags_riga:
             return
 
         id_movimento = self.movimenti_log.get(id_riga)
         if id_movimento is None:
-            # Riga senza movimento DB associato (es. "ANNULLATO - Giacenza: ...", o riga storica precedente all'aggiornamento)
             messagebox.showinfo("Info", "Questa riga non corrisponde a un movimento registrabile e non può essere annullata da qui.")
             return
 
-        if not messagebox.askyesno("Annulla Operazione", f"Annullare questa operazione?\n\n{valori[1]} - Cod. {valori[3]} - Q.tà {valori[2]}\n\nIl movimento verrà eliminato dal database e la giacenza ricalcolata di conseguenza."):
+        righe = self.leggi("SELECT id_transazione, quantita, codice FROM movimenti_magazzino WHERE id = ? AND storico_passivo = 0", (id_movimento,))
+        if not righe:
+            messagebox.showinfo("Info", "Il movimento risulta già annullato o non esiste più.")
+            return
+        id_transazione, qta_mov, codice_mov = righe[0]
+
+        avviso = f"Annullare questa operazione?\n\n{valori[1]} - Cod. {valori[3]} - Q.tà {valori[2]}\n\nLa giacenza verrà ricalcolata di conseguenza."
+        if id_transazione is not None:
+            avviso += "\n\nIl movimento fa parte di una vendita registrata: il totale della transazione verrà ridotto di conseguenza."
+
+        if not messagebox.askyesno("Annulla Operazione", avviso):
             return
 
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("DELETE FROM movimenti_magazzino WHERE id = ?", (id_movimento,))
-            self.conn.commit()
-        except sqlite3.Error as e:
-            self.conn.rollback()
-            messagebox.showerror("Errore DB", str(e))
+        def azione(cursor):
+            # storico_passivo = 1 invece di DELETE: il movimento smette di
+            # contare nelle giacenze ma resta nello storico, e le righe di
+            # transazioni non restano orfane.
+            cursor.execute("UPDATE movimenti_magazzino SET storico_passivo = 1 WHERE id = ?", (id_movimento,))
+            if id_transazione is not None:
+                prezzo = cursor.execute("SELECT COALESCE(prezzo_vendita, 0) FROM articoli WHERE codice = ?", (codice_mov,)).fetchone()
+                importo = (prezzo[0] if prezzo else 0.0) * qta_mov
+                cursor.execute("UPDATE transazioni SET totale = ROUND(MAX(totale - ?, 0), 2) WHERE id = ?", (importo, id_transazione))
+
+        ok, _ = self.scrivi(azione)
+        if not ok:
             return
 
         valori[4] = ''.join(c + '\u0336' for c in esito) + ' [ANNULLATO]'
@@ -986,38 +1267,48 @@ class TerminaleMagazzino:
             messagebox.showwarning("Attenzione", "Il carrello è vuoto.")
             return
 
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("INSERT INTO transazioni (totale, metodo_pagamento) VALUES (?, ?)", (self.totale_carrello_val, metodo))
+        carrello = list(self.carrello)
+        totale = round(self.totale_carrello_val, 2)
+        ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
+
+        def azione(cursor):
+            cursor.execute("INSERT INTO transazioni (totale, metodo_pagamento) VALUES (?, ?)", (totale, metodo))
             id_transazione = cursor.lastrowid
 
-            ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
+            eventi = []
+            for item in carrello:
+                # Le rettifiche delle vendite forzate si scrivono QUI, nella
+                # stessa transazione della vendita. Prima venivano committate
+                # subito all'apertura del popup: se poi la riga usciva dal
+                # carrello o il pagamento non arrivava, lo stock restava gonfiato.
+                inventario.registra_rettifica(
+                    cursor, item['codice'], item['origine'], item.get('rettifica', 0),
+                    "Allineamento forzato per vendita sottoscorta")
 
-            for item in self.carrello:
-                try:
-                    cursor.execute("""
-                                   INSERT INTO movimenti_magazzino
-                                   (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_transazione)
-                                   VALUES (?, ?, ?, ?, ?, ?)
-                                   """, (item['codice'], item['qta'], item['origine'], item['destinazione'], 2, id_transazione))
-                except sqlite3.OperationalError:
-                    cursor.execute("""
-                                   INSERT INTO movimenti_magazzino
-                                       (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo)
-                                   VALUES (?, ?, ?, ?, ?)
-                                   """, (item['codice'], item['qta'], item['origine'], item['destinazione'], 2))
+                cursor.execute("""
+                               INSERT INTO movimenti_magazzino
+                               (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_transazione)
+                               VALUES (?, ?, ?, ?, ?, ?)
+                               """, (item['codice'], item['qta'], item['origine'], item['destinazione'],
+                                     inventario.SCARICO, id_transazione))
                 id_movimento = cursor.lastrowid
 
                 extra = f" ({item['colore'] or ''} {item['taglia'] or ''})".strip()
-                self.aggiorna_log(ora_attuale, "Scarico (Vendita)", item['qta'], item['codice'], f"OK - {item['desc']}{extra if extra != '()' else ''} [{metodo}]", id_movimento=id_movimento)
+                eventi.append((ora_attuale, "Scarico (Vendita)", item['qta'], item['codice'],
+                               f"OK - {item['desc']}{extra if extra != '()' else ''} [{metodo}]", id_movimento))
+            return eventi
 
-            self.conn.commit()
-            messagebox.showinfo("Successo", f"Transazione completata con successo.\nTotale: € {self.totale_carrello_val:.2f}\nMetodo: {metodo}")
-            self.svuota_carrello()
+        ok, eventi = self.scrivi(azione, titolo_errore="Errore durante la transazione")
+        if not ok:
+            return
 
-        except Exception as e:
-            self.conn.rollback()
-            messagebox.showerror("Errore", f"Errore durante la transazione:\n{e}")
+        # Il log si aggiorna solo dopo il commit: prima le righe comparivano
+        # anche quando la transazione veniva poi annullata.
+        for ora, op, qta, codice, esito, id_movimento in eventi:
+            self.aggiorna_log(ora, op, qta, codice, esito, id_movimento=id_movimento)
+
+        messagebox.showinfo("Successo", f"Transazione completata con successo.\nTotale: € {totale:.2f}\nMetodo: {metodo}")
+        self.svuota_carrello()
 
     def avvia_registrazione(self, event):
         codice = self.entry_codice.get().strip()
@@ -1025,123 +1316,126 @@ class TerminaleMagazzino:
         if not codice: return
         try:
             qta = self.var_qta.get()
-            if qta <= 0: raise ValueError
-        except: qta = 1
+            if qta <= 0:
+                qta = 1
+        except (tk.TclError, ValueError):
+            qta = 1
         tipo = self.tipo_movimento.get()
-        nome_op = {1: "Carico", 2: "Scarico", 3: "Reso Cliente", 4: "Reso Fornitore"}.get(tipo)
+        nome_op = {inventario.CARICO: "Carico", inventario.SCARICO: "Scarico",
+                   inventario.RESO_CLIENTE: "Reso Cliente",
+                   inventario.RESO_FORNITORE: "Reso Fornitore"}.get(tipo)
         ora_attuale = datetime.datetime.now().strftime("%H:%M:%S")
 
         id_fornitore = None
         bolla = None
-        if tipo == 1:
+        if tipo == inventario.CARICO:
             fornitore_nome = self.combo_fornitore.get()
             if fornitore_nome:
                 for f in self.lista_fornitori:
                     if f[1] == fornitore_nome:
                         id_fornitore = f[0]
                         break
-            bolla = self.entry_bolla.get().strip()
+            bolla = self.entry_bolla.get().strip() or None
 
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita FROM articoli WHERE codice = ?", (codice,))
-        articolo = cursor.fetchone()
-        origine, destinazione = (1, None) if tipo in (2, 4) else (None, 1)
+        righe = self.leggi("SELECT descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita FROM articoli WHERE codice = ?", (codice,))
+        articolo = righe[0] if righe else None
+        origine, destinazione = (NEGOZIO, None) if tipo in (inventario.SCARICO, inventario.RESO_FORNITORE) else (None, NEGOZIO)
 
         if not articolo:
             self.mostra_popup_nuovo_articolo(codice, tipo, origine, destinazione, nome_op, ora_attuale, qta, id_fornitore, bolla)
             return
 
-        if tipo == 2:
-            cursor.execute("""
-                           SELECT COALESCE(SUM(CASE WHEN id_deposito_destinazione = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0) -
-                                  COALESCE(SUM(CASE WHEN id_deposito_origine = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0)
-                           FROM movimenti_magazzino WHERE codice = ?
-                           """, (origine, origine, codice))
-            giac = cursor.fetchone()[0]
+        if tipo == inventario.SCARICO:
+            with self.db_lock:
+                giac = inventario.giacenza(self.conn, codice, origine)
 
             # Tiene conto di eventuali quantità dello stesso articolo già presenti nel carrello,
             # non ancora scaricate dal DB, per non far passare due vendite che insieme superano la giacenza
-            qta_gia_in_carrello = sum(i['qta'] for i in self.carrello if i['codice'] == codice)
+            qta_gia_in_carrello = inventario.quantita_in_carrello(self.carrello, codice)
 
             if giac < (qta + qta_gia_in_carrello):
                 disponibile_reale = max(giac - qta_gia_in_carrello, 0)
                 self.mostra_popup_sottoscorta(codice, origine, destinazione, tipo, nome_op, ora_attuale, qta, disponibile_reale, articolo, id_fornitore, bolla)
                 return
 
-            item = {
-                'codice': codice,
-                'desc': articolo[0],
-                'colore': articolo[1],
-                'taglia': articolo[2],
-                'prezzo': articolo[4] or 0.0,
-                'qta': qta,
-                'origine': origine,
-                'destinazione': destinazione
-            }
-            self.carrello.append(item)
-            self.aggiorna_ui_carrello()
-            self.var_qta.set(1)
-            item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"AGGIUNTO AL CARRELLO - {articolo[0]}")
+            self.aggiungi_al_carrello(codice, articolo, qta, origine, destinazione, nome_op, ora_attuale)
             return
 
         if origine is not None:
-            cursor.execute("""
-                           SELECT COALESCE(SUM(CASE WHEN id_deposito_destinazione = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0) -
-                                  COALESCE(SUM(CASE WHEN id_deposito_origine = ? THEN (CASE WHEN storico_passivo = 0 THEN quantita ELSE 0 END) ELSE 0 END), 0)
-                           FROM movimenti_magazzino WHERE codice = ?
-                           """, (origine, origine, codice))
-            giac = cursor.fetchone()[0]
+            with self.db_lock:
+                giac = inventario.giacenza(self.conn, codice, origine)
             if giac < qta:
                 self.mostra_popup_sottoscorta(codice, origine, destinazione, tipo, nome_op, ora_attuale, qta, giac, articolo, id_fornitore, bolla)
                 return
         self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, articolo[0], qta, articolo[1], articolo[2], id_fornitore, bolla)
 
+    def aggiungi_al_carrello(self, codice, articolo, qta, origine, destinazione, nome_op, ora_attuale,
+                             rettifica=0, forzato=False):
+        """Mette una riga nel carrello. rettifica = pezzi da allineare al pagamento."""
+        item = {
+            'codice': codice,
+            'desc': articolo[0],
+            'colore': articolo[1],
+            'taglia': articolo[2],
+            'prezzo': (articolo[4] if len(articolo) > 4 else 0.0) or 0.0,
+            'qta': qta,
+            'origine': origine,
+            'destinazione': destinazione,
+            'rettifica': rettifica,
+        }
+        self.carrello.append(item)
+        self.aggiorna_ui_carrello()
+        self.var_qta.set(1)
+        etichetta = "AGGIUNTO AL CARRELLO (forzato)" if forzato else "AGGIUNTO AL CARRELLO"
+        item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"{etichetta} - {articolo[0]}")
+        return item
+
     def mostra_popup_sottoscorta(self, codice, origine, destinazione, tipo, nome_op, ora_attuale, qta_req, giac, articolo, id_fornitore=None, bolla=None):
         popup = tk.Toplevel(self.root)
         popup.title("Avviso")
-        popup.geometry("550x250")
+        popup.geometry("560x260")
         popup.grab_set()
         ttk.Label(popup, text="ATTENZIONE: DISCREPANZA INVENTARIO", font=('Helvetica', 14, 'bold'), bootstyle="danger").pack(pady=15)
         ttk.Label(popup, text=f"Richiesti {qta_req} di {articolo[0]}.\nDisponibili: {giac}", justify=tk.CENTER).pack(pady=10)
+        mancanti = qta_req - giac
         btn_frame = ttk.Frame(popup)
         btn_frame.pack(pady=10)
+
         def annulla():
             self.aggiorna_log(ora_attuale, nome_op, qta_req, codice, f"ANNULLATO - Giacenza: {giac}")
             popup.destroy()
+
         def forza():
-            try:
-                self.conn.cursor().execute("""
-                                           INSERT INTO movimenti_magazzino
-                                           (codice, quantita, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla)
-                                           VALUES (?, ?, ?, 6, ?, ?)
-                                           """, (codice, qta_req - giac, origine, id_fornitore, bolla))
-            except sqlite3.OperationalError:
-                self.conn.cursor().execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, ?, 6)", (codice, qta_req - giac, origine))
-
-            self.conn.commit()
             popup.destroy()
-
-            if tipo == 2:
-                # Vendita forzata: resta nel flusso carrello/pagamento, non scarica subito
-                item = {
-                    'codice': codice,
-                    'desc': articolo[0],
-                    'colore': articolo[1],
-                    'taglia': articolo[2],
-                    'prezzo': articolo[4] or 0.0,
-                    'qta': qta_req,
-                    'origine': origine,
-                    'destinazione': destinazione
-                }
-                self.carrello.append(item)
-                self.aggiorna_ui_carrello()
-                self.var_qta.set(1)
-                item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta_req, codice, f"AGGIUNTO AL CARRELLO (forzato) - {articolo[0]}")
+            if tipo == inventario.SCARICO:
+                # La rettifica viaggia con la riga di carrello e viene scritta
+                # solo al pagamento, insieme allo scarico.
+                self.aggiungi_al_carrello(codice, articolo, qta_req, origine, destinazione,
+                                          nome_op, ora_attuale, rettifica=mancanti, forzato=True)
                 return
 
-            self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, articolo[0], qta_req, articolo[1], articolo[2], id_fornitore, bolla)
+            def azione(cursor):
+                inventario.registra_rettifica(cursor, codice, origine, mancanti,
+                                              "Allineamento forzato da discrepanza inventario")
+                cursor.execute("""
+                               INSERT INTO movimenti_magazzino
+                               (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)
+                               """, (codice, qta_req, origine, destinazione, tipo, id_fornitore, bolla))
+                return cursor.lastrowid
+
+            ok, id_movimento = self.scrivi(azione)
+            if not ok:
+                return
+            extra = f" ({articolo[1] or ''} {articolo[2] or ''})".strip()
+            self.aggiorna_log(ora_attuale, nome_op, qta_req, codice,
+                              f"OK (forzato) - {articolo[0]}{extra if extra != '()' else ''}",
+                              id_movimento=id_movimento)
+            self.var_qta.set(1)
+
         ttk.Button(btn_frame, text="Annulla", command=annulla, bootstyle="secondary").pack(side=tk.LEFT, padx=10)
-        ttk.Button(btn_frame, text=f"Forza Allineamento (+{qta_req - giac})", command=forza, bootstyle="warning").pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text=f"Forza Allineamento (+{mancanti})", command=forza, bootstyle="warning").pack(side=tk.LEFT, padx=10)
+        popup.bind('<Escape>', lambda e: annulla())
 
     def mostra_popup_nuovo_articolo(self, codice, tipo, origine, destinazione, nome_op, ora_attuale, qta, id_fornitore=None, bolla=None):
         popup = tk.Toplevel(self.root)
@@ -1151,65 +1445,90 @@ class TerminaleMagazzino:
         form = ttk.Frame(popup)
         form.pack(fill=tk.BOTH, expand=True, ipadx=10, ipady=10)
         entries = {}
+        var_stampa_etichetta = tk.BooleanVar(value=False)
         for i, (label, key) in enumerate([("Descrizione:", "desc"), ("Colore:", "col"), ("Taglia:", "tag"), ("Costo Acq:", "acq"), ("Prezzo Ven:", "ven")]):
             ttk.Label(form, text=label).grid(row=i, column=0, sticky=tk.E, pady=5)
             ent = ttk.Entry(form, width=30)
             ent.grid(row=i, column=1, pady=5)
             entries[key] = ent
+        if tipo == inventario.CARICO:
+            chk_stampa = ttk.Checkbutton(
+                form,
+                text="Stampa etichetta barcode",
+                variable=var_stampa_etichetta,
+                bootstyle="round-toggle"
+            )
+            chk_stampa.grid(row=len(entries), column=1, sticky=tk.W, pady=(10, 0))
         entries["desc"].focus()
 
         def salva(e=None):
             desc = entries["desc"].get().strip()
-            if not desc: return
-
-            colore_val = entries["col"].get()
-            taglia_val = entries["tag"].get()
-
-            acq_s, ven_s = entries["acq"].get().replace(',', '.'), entries["ven"].get().replace(',', '.')
-            acq = float(acq_s) if acq_s.replace('.','',1).isdigit() else 0.0
-            ven = float(ven_s) if ven_s.replace('.','',1).isdigit() else 0.0
-
-            self.conn.cursor().execute("INSERT INTO articoli (codice, descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita) VALUES (?, ?, ?, ?, ?, ?)", (codice, desc, colore_val, taglia_val, acq, ven))
-
-            if tipo == 2:
-                self.conn.cursor().execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo) VALUES (?, ?, ?, 1)", (codice, qta, origine))
-                self.conn.commit()
-
-                item = {
-                    'codice': codice,
-                    'desc': desc,
-                    'colore': colore_val,
-                    'taglia': taglia_val,
-                    'prezzo': ven,
-                    'qta': qta,
-                    'origine': origine,
-                    'destinazione': destinazione
-                }
-                self.carrello.append(item)
-                self.aggiorna_ui_carrello()
-                self.var_qta.set(1)
-                item['id_riga_log'] = self.aggiorna_log(ora_attuale, nome_op, qta, codice, f"AGGIUNTO AL CARRELLO - {desc}")
-                popup.destroy()
-                self._chiedi_stampa_etichetta(codice)
+            if not desc:
+                messagebox.showwarning("Attenzione", "La descrizione è obbligatoria.")
                 return
 
-            self.conn.commit()
+            colore_val = entries["col"].get().strip()
+            taglia_val = entries["tag"].get().strip()
 
-            self.esegui_query_movimento(codice, origine, destinazione, tipo, nome_op, ora_attuale, desc, qta, colore_val, taglia_val, id_fornitore, bolla)
+            try:
+                acq = parse_prezzo(entries["acq"].get(), "Costo Acquisto")
+                ven = parse_prezzo(entries["ven"].get(), "Prezzo Vendita")
+            except ValoreNonValido as err:
+                messagebox.showerror("Valore non valido", str(err))
+                return
+
+            def azione(cursor):
+                # INSERT protetto: il codice arriva da uno scanner e i duplicati
+                # sono normali. Prima l'IntegrityError usciva come traceback su
+                # stderr e lasciava la connessione in transazione aperta.
+                try:
+                    cursor.execute("INSERT INTO articoli (codice, descrizione, colore, taglia, prezzo_acquisto, prezzo_vendita) VALUES (?, ?, ?, ?, ?, ?)",
+                                   (codice, desc, colore_val, taglia_val, acq, ven))
+                except sqlite3.IntegrityError:
+                    raise sqlite3.Error(f"L'articolo {codice} esiste già in anagrafica. Chiudi questa finestra e rileggi il codice.")
+
+                if tipo == inventario.SCARICO:
+                    # Vendita di un articolo mai censito: prima lo si carica,
+                    # poi la riga va nel carrello e lo scarico avviene al pagamento.
+                    cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_destinazione, tipo, riferimento_bolla) VALUES (?, ?, ?, ?, ?)",
+                                   (codice, qta, origine, inventario.CARICO, "Carico implicito da vendita di articolo nuovo"))
+                    return None
+
+                cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                               (codice, qta, origine, destinazione, tipo, id_fornitore, bolla))
+                return cursor.lastrowid
+
+            ok, id_movimento = self.scrivi(azione)
+            if not ok:
+                return
+
             popup.destroy()
-            self._chiedi_stampa_etichetta(codice)
+            articolo = (desc, colore_val, taglia_val, acq, ven)
+
+            if tipo == inventario.SCARICO:
+                self.aggiungi_al_carrello(codice, articolo, qta, origine, destinazione, nome_op, ora_attuale)
+                return
+
+            extra = f" ({colore_val or ''} {taglia_val or ''})".strip()
+            self.aggiorna_log(ora_attuale, nome_op, qta, codice,
+                              f"OK - {desc}{extra if extra != '()' else ''}", id_movimento=id_movimento)
+            self.var_qta.set(1)
+
+            if tipo == inventario.CARICO and var_stampa_etichetta.get():
+                self._chiedi_stampa_etichetta(codice)
 
         ttk.Button(popup, text="Salva", command=salva, bootstyle="success").pack(pady=10)
         popup.bind('<Return>', salva)
 
     def esegui_query_movimento(self, codice, origine, destinazione, tipo, nome_op, ora, desc, qta, colore, taglia, id_fornitore=None, bolla=None):
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla) VALUES (?, ?, ?, ?, ?, ?, ?)", (codice, qta, origine, destinazione, tipo, id_fornitore, bolla))
-        except sqlite3.OperationalError:
-            cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo) VALUES (?, ?, ?, ?, ?)", (codice, qta, origine, destinazione, tipo))
-        id_movimento = cursor.lastrowid
-        self.conn.commit()
+        def azione(cursor):
+            cursor.execute("INSERT INTO movimenti_magazzino (codice, quantita, id_deposito_origine, id_deposito_destinazione, tipo, id_fornitore, riferimento_bolla) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (codice, qta, origine, destinazione, tipo, id_fornitore, bolla))
+            return cursor.lastrowid
+
+        ok, id_movimento = self.scrivi(azione)
+        if not ok:
+            return
         extra = f" ({colore or ''} {taglia or ''})".strip()
         self.aggiorna_log(ora, nome_op, qta, codice, f"OK - {desc}{extra if extra != '()' else ''}", id_movimento=id_movimento)
         self.var_qta.set(1)
@@ -1225,6 +1544,7 @@ class TerminaleMagazzino:
         return id_riga
 
 if __name__ == "__main__":
+    configura_logging()
     inizializza_database()
     root = ttk.Window(themename="minty")
     app = TerminaleMagazzino(root)

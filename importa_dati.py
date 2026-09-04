@@ -1,5 +1,7 @@
 import csv
 import sqlite3
+
+from db import connetti
 import sys
 
 def pulisci_prezzo(valore_str):
@@ -21,7 +23,7 @@ def esegui_migrazione():
             prima_riga = f.readline()
             delimitatore = ';' if ';' in prima_riga else ','
             
-        conn = sqlite3.connect('magazzino.db')
+        conn = connetti()
         cursor = conn.cursor()
         
         conteggio_articoli = 0
@@ -88,7 +90,7 @@ def esegui_migrazione():
         print(f"ERRORE CRITICO durante l'importazione: {e}")
 
 def importa_storico_passivo():
-    conn = sqlite3.connect('magazzino.db')
+    conn = connetti()
     cursor = conn.cursor()
 
     # Mappatura colonne reale dei file (verificata sui CSV):
