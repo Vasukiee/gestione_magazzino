@@ -195,8 +195,15 @@ class TerminaleMagazzino:
         self.on_closing()
 
     def setup_ui(self):
+        # Footer fisso in basso (creato prima del notebook per riservargli lo spazio)
+        ttk.Label(
+            self.root,
+            text="Sviluppato da Giovanni Poggi  ·  valore di mercato stimato di un software equivalente: 8.000–16.000 €  ·  manutenzione annuale media: 1.500–2.500 €",
+            font=('Helvetica', 8), foreground='#9a9a9a', anchor=tk.CENTER,
+        ).pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
+
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 4))
 
         self.tab_movimenti = ttk.Frame(self.notebook)
         self.tab_trasferimenti = ttk.Frame(self.notebook)
